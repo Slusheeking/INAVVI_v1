@@ -28,18 +28,53 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import pytz
+import functools
 from dotenv import load_dotenv
-from retrying import retry
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.feature_selection import (
     RFE,
     SelectFromModel,
     mutual_info_classif,
-    mutual_info_regression,
+    mutual_info_regression
 )
 from sklearn.preprocessing import MinMaxScaler
+# Default tickers for market data and testing
+DEFAULT_TICKERS = ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "TSLA", "NVDA", "SPY", "QQQ", "IWM", "DIA"]
 
-from config import config
+# Custom retry decorator to replace retrying library
+def retry(stop_max_attempt_number=3, wait_exponential_multiplier=1000, wait_exponential_max=10000):
+    """
+    Custom retry decorator that mimics the functionality of the retrying library
+    
+    Args:
+        stop_max_attempt_number: Maximum number of retry attempts
+        wait_exponential_multiplier: Base multiplier for exponential backoff in ms
+        wait_exponential_max: Maximum wait time between retries in ms
+        
+    Returns:
+        Decorated function with retry logic
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            attempt = 0
+            while attempt < stop_max_attempt_number:
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    attempt += 1
+                    if attempt == stop_max_attempt_number:
+                        raise e
+                    
+                    # Calculate wait time with exponential backoff
+                    wait_time = min(
+                        wait_exponential_multiplier * (2 ** (attempt - 1)),
+                        wait_exponential_max
+                    ) / 1000.0  # Convert ms to seconds
+                    
+                    time.sleep(wait_time)
+        return wrapper
+    return decorator
 
 # Load environment variables from .env file
 load_dotenv()
@@ -65,7 +100,6 @@ except ImportError:
 try:
     import torch
     import torch.onnx
-    from torch.utils.data import DataLoader, TensorDataset
     
     TORCH_AVAILABLE = True
     CUDA_AVAILABLE = torch.cuda.is_available()
@@ -74,17 +108,21 @@ try:
     try:
         import tensorrt as trt
         import onnx
-        from onnx_tf.backend import prepare
         
+        ONNX_AVAILABLE = True
         TENSORRT_AVAILABLE = True
     except ImportError:
+        ONNX_AVAILABLE = False
         TENSORRT_AVAILABLE = False
         trt = None
+        onnx = None
 except ImportError:
     TORCH_AVAILABLE = False
     CUDA_AVAILABLE = False
+    ONNX_AVAILABLE = False
     TENSORRT_AVAILABLE = False
     trt = None
+    onnx = None
 
 # Configure logging
 logging.basicConfig(
@@ -151,6 +189,19 @@ try:
         "data_pipeline_feature_count",
         "Number of features used in models",
         ["model_type"],
+    )
+    
+    # Add metrics for PyTorch and ONNX
+    MODEL_OPTIMIZATION_COUNT = Counter(
+        "data_pipeline_model_optimization_total",
+        "Number of model optimizations performed",
+        ["framework", "precision"],
+    )
+    
+    MODEL_INFERENCE_TIME = Histogram(
+        "data_pipeline_model_inference_time_seconds",
+        "Time spent on model inference",
+        ["model_type", "framework", "precision"],
     )
 
 except ImportError:
@@ -321,24 +372,18 @@ class DataPipeline:
                     f"Error creating directory {directory}: {e!s}")
 
     def _initialize_gpu(self) -> None:
-        """Initialize GPU memory for data processing with TensorFlow, TensorRT, and CuPy integration"""
+        """Initialize GPU memory for data processing with PyTorch, TensorRT, and CuPy integration"""
         try:
             # Initialize GPU configuration
             self.gpu_config = {
                 "memory_limit_mb": int(
-                    os.environ.get("TF_CUDA_HOST_MEM_LIMIT_IN_MB", "16000"),
+                    os.environ.get("PYTORCH_CUDA_MEMORY_LIMIT_MB", "16000"),
                 ),
                 "tensorrt_precision": os.environ.get("TENSORRT_PRECISION_MODE", "FP16"),
-                "mixed_precision": os.environ.get("TF_MIXED_PRECISION", "true").lower()
+                "mixed_precision": os.environ.get("PYTORCH_MIXED_PRECISION", "true").lower()
                 == "true",
-                "memory_growth": os.environ.get(
-                    "TF_FORCE_GPU_ALLOW_GROWTH", "true",
-                ).lower()
-                == "true",
-                "xla_optimization": os.environ.get("TF_XLA_FLAGS", "").find(
-                    "auto_jit=2",
-                )
-                != -1,
+                "use_amp": os.environ.get("PYTORCH_USE_AMP", "true").lower() == "true",
+                "onnx_optimization": os.environ.get("PYTORCH_ONNX_OPTIMIZE", "true").lower() == "true",
             }
 
             # Initialize CuPy if available
@@ -378,7 +423,7 @@ class DataPipeline:
                                     f"Using GH200 device with {free/(1024**3):.2f}GB free / {total/(1024**3):.2f}GB total memory",
                                 )
 
-                                # Store device ID for TensorFlow
+                                # Store device ID for PyTorch
                                 self.gpu_device_id = i
                                 break
 
@@ -393,7 +438,7 @@ class DataPipeline:
                         self.mempool = cp.cuda.MemoryPool()
                         cp.cuda.set_allocator(self.mempool.malloc)
 
-                        # Store device ID for TensorFlow
+                        # Store device ID for PyTorch
                         self.gpu_device_id = device_id
 
                         logger.info(
@@ -441,8 +486,9 @@ class DataPipeline:
                         # Enable mixed precision if configured
                         if self.gpu_config["mixed_precision"]:
                             try:
-                                from torch.cuda.amp import autocast
+                                from torch.cuda.amp import autocast, GradScaler
                                 self.autocast = autocast
+                                self.grad_scaler = GradScaler() if self.gpu_config["use_amp"] else None
                                 logger.info("Enabled mixed precision (float16) for PyTorch")
                             except Exception as e:
                                 logger.warning(f"Could not enable mixed precision: {e}")
@@ -461,9 +507,11 @@ class DataPipeline:
                         }
                         logger.info("PyTorch GPU utilities initialized")
 
-                        # Check TensorRT availability for ONNX optimization
-                        if TENSORRT_AVAILABLE:
-                            logger.info(f"TensorRT is available for model optimization via ONNX (precision: {self.gpu_config['tensorrt_precision']})")
+                        # Add ONNX and TensorRT optimization for PyTorch models
+                        if TENSORRT_AVAILABLE and self.gpu_config["onnx_optimization"]:
+                            # Add PyTorch to ONNX to TensorRT conversion utility
+                            self.torch_utils["optimize_with_tensorrt"] = self._optimize_pytorch_model_with_tensorrt
+                            logger.info(f"TensorRT is available for PyTorch model optimization via ONNX (precision: {self.gpu_config['tensorrt_precision']})")
                     else:
                         logger.warning("No GPU detected by PyTorch")
                         self.torch_utils = None
@@ -481,8 +529,10 @@ class DataPipeline:
                 logger.info("GPU acceleration successfully initialized with:")
                 if CUDA_AVAILABLE and cp.cuda.is_available():
                     logger.info("- CuPy for array operations")
-                if TF_AVAILABLE and hasattr(self, "tf_utils") and self.tf_utils:
-                    logger.info("- TensorFlow for tensor operations")
+                if TORCH_AVAILABLE and torch.cuda.is_available():
+                    logger.info("- PyTorch for tensor operations")
+                    if ONNX_AVAILABLE:
+                        logger.info("- ONNX for model interoperability")
                     if TENSORRT_AVAILABLE:
                         logger.info("- TensorRT for model optimization")
 
@@ -494,7 +544,8 @@ class DataPipeline:
                     details={
                         "gpu_enabled": True,
                         "cupy_available": CUDA_AVAILABLE and cp.cuda.is_available(),
-                        "tensorflow_available": TF_AVAILABLE and hasattr(self, "tf_utils") and self.tf_utils is not None,
+                        "pytorch_available": TORCH_AVAILABLE and torch.cuda.is_available(),
+                        "onnx_available": ONNX_AVAILABLE,
                         "tensorrt_available": TENSORRT_AVAILABLE,
                         "device_name": cp.cuda.Device().name.decode() if CUDA_AVAILABLE and cp.cuda.is_available() else "Unknown"
                     }
@@ -503,7 +554,7 @@ class DataPipeline:
         except Exception as e:
             logger.exception(f"Error initializing GPU: {e}")
             self.use_gpu = False
-            self.tf_utils = None
+            self.torch_utils = None
 
             # Send notification to frontend about GPU initialization failure
             self._send_frontend_notification(
@@ -825,7 +876,7 @@ class DataPipeline:
             # Send notification about successful GPU processing
             if self.redis and hasattr(result, 'shape') and len(result.shape) > 0 and result.shape[0] > 0:
                 self._send_frontend_notification(
-                    message=f"GPU-accelerated data processing completed successfully",
+                    message="GPU-accelerated data processing completed successfully",
                     level="info",
                     category="gpu_processing",
                     details={
@@ -862,9 +913,139 @@ class DataPipeline:
 
             return df
 
-    def _process_with_tensorflow(self, df, batch_size=1000):
+    def _optimize_pytorch_model_with_tensorrt(self, model, input_shape, onnx_path=None, engine_path=None):
         """
-        Process DataFrame with TensorFlow GPU acceleration
+        Optimize a PyTorch model with TensorRT via ONNX
+        
+        Args:
+            model: PyTorch model to optimize
+            input_shape: Shape of input tensor (excluding batch dimension)
+            onnx_path: Path to save ONNX model (optional)
+            engine_path: Path to save TensorRT engine (optional)
+            
+        Returns:
+            TensorRT engine that can be used for inference
+        """
+        if not TENSORRT_AVAILABLE or not TORCH_AVAILABLE or not ONNX_AVAILABLE:
+            logger.error(f"Model optimization not available: TensorRT={TENSORRT_AVAILABLE}, PyTorch={TORCH_AVAILABLE}, ONNX={ONNX_AVAILABLE}")
+            return None
+            
+        try:
+            # Start timing for Prometheus metrics
+            start_time = time.time()
+            
+            import torch.onnx
+            import tensorrt as trt
+            import onnx
+            
+            # Default paths if not provided
+            if onnx_path is None:
+                onnx_path = os.path.join(self.config["cache_dir"], "model.onnx")
+            if engine_path is None:
+                engine_path = os.path.join(self.config["cache_dir"], "model.engine")
+                
+            # Create directories if they don't exist
+            os.makedirs(os.path.dirname(onnx_path), exist_ok=True)
+            os.makedirs(os.path.dirname(engine_path), exist_ok=True)
+            
+            # Set model to evaluation mode
+            model.eval()
+            
+            # Create dummy input tensor
+            dummy_input = torch.randn(1, *input_shape, device='cuda')
+            
+            # Export to ONNX
+            torch.onnx.export(
+                model,
+                dummy_input,
+                onnx_path,
+                export_params=True,
+                opset_version=13,
+                do_constant_folding=True,
+                input_names=['input'],
+                output_names=['output'],
+                dynamic_axes={'input': {0: 'batch_size'}, 'output': {0: 'batch_size'}}
+            )
+            
+            logger.info(f"PyTorch model exported to ONNX: {onnx_path}")
+            
+            # Verify ONNX model
+            onnx_model = onnx.load(onnx_path)
+            onnx.checker.check_model(onnx_model)
+            
+            # Log ONNX model info
+            logger.info(f"ONNX model verified (opset version: {onnx_model.opset_import[0].version})")
+            
+            # Create TensorRT engine
+            logger.info("Creating TensorRT engine from ONNX model...")
+            
+            # Initialize TensorRT engine
+            TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
+            builder = trt.Builder(TRT_LOGGER)
+            network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+            parser = trt.OnnxParser(network, TRT_LOGGER)
+            
+            # Parse ONNX model
+            with open(onnx_path, 'rb') as model_file:
+                if not parser.parse(model_file.read()):
+                    for error in range(parser.num_errors):
+                        logger.error(f"TensorRT ONNX parser error: {parser.get_error(error)}")
+                    return None
+            
+            # Configure builder
+            config = builder.create_builder_config()
+            config.max_workspace_size = 1 << 30  # 1GB
+            
+            # Set precision based on configuration
+            if self.gpu_config["tensorrt_precision"] == "FP16" and builder.platform_has_fast_fp16:
+                config.set_flag(trt.BuilderFlag.FP16)
+                logger.info("Enabling FP16 precision for TensorRT")
+            
+            # Build and save engine
+            serialized_engine = builder.build_serialized_network(network, config)
+            with open(engine_path, 'wb') as f:
+                f.write(serialized_engine)
+            
+            logger.info(f"TensorRT engine saved to: {engine_path}")
+            
+            # Create runtime and engine
+            runtime = trt.Runtime(TRT_LOGGER)
+            with open(engine_path, 'rb') as f:
+                engine = runtime.deserialize_cuda_engine(f.read())
+            
+            # Record processing time in Prometheus metrics
+            if PROMETHEUS_AVAILABLE:
+                processing_time = time.time() - start_time
+                DATA_PROCESSING_TIME.labels(
+                    operation="optimize_pytorch_model_tensorrt",
+                    use_gpu="true"
+                ).observe(processing_time)
+                
+                # Record model optimization in Prometheus
+                MODEL_OPTIMIZATION_COUNT.labels(
+                    framework="pytorch_onnx_tensorrt",
+                    precision=self.gpu_config["tensorrt_precision"]
+                ).inc()
+                
+                logger.info(f"Model optimization completed in {processing_time:.2f} seconds")
+            
+            return engine
+            
+        except Exception as e:
+            logger.exception(f"Error optimizing PyTorch model with TensorRT: {e}")
+            
+            # Record error in Prometheus
+            if PROMETHEUS_AVAILABLE:
+                API_ERROR_COUNT.labels(
+                    api="tensorrt",
+                    endpoint="optimize_model",
+                    error_type=type(e).__name__
+                ).inc()
+            return None
+    
+    def _process_with_pytorch(self, df, batch_size=1000):
+        """
+        Process DataFrame with PyTorch GPU acceleration
 
         Args:
             df: Input DataFrame
@@ -874,11 +1055,11 @@ class DataPipeline:
             Processed DataFrame
         """
         if (
-            not TF_AVAILABLE
+            not TORCH_AVAILABLE
             or not self.use_gpu
             or df is None
             or df.empty
-            or not hasattr(self, "tf_utils")
+            or not torch.cuda.is_available()
         ):
             return df
 
@@ -892,113 +1073,114 @@ class DataPipeline:
             # Create a copy to avoid modifying the original
             result = df.copy()
 
-            # Process with TensorFlow on GPU
-            with tf.device("/GPU:0"):
-                # Convert key columns to tensors
-                tensors = {}
-                for col in numeric_cols:
-                    if col in ["close", "open", "high", "low", "volume"]:
-                        tensors[col] = tf.convert_to_tensor(
-                            df[col].values, dtype=tf.float32,
-                        )
+            # Process with PyTorch on GPU
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            
+            # Convert key columns to tensors
+            tensors = {}
+            for col in numeric_cols:
+                if col in ["close", "open", "high", "low", "volume"]:
+                    tensors[col] = torch.tensor(
+                        df[col].values, dtype=torch.float32, device=device
+                    )
 
-                # Process in batches if data is large
-                if len(df) > batch_size and "close" in tensors:
-                    # Calculate momentum features
-                    close_tensor = tensors["close"]
+            # Process in batches if data is large
+            if len(df) > batch_size and "close" in tensors:
+                # Calculate momentum features
+                close_tensor = tensors["close"]
 
-                    # Calculate momentum (percent change)
-                    mom1 = tf.concat(
+                # Calculate momentum (percent change)
+                mom1 = torch.cat(
+                    [
+                        torch.zeros(1, device=device),
+                        (close_tensor[1:] - close_tensor[:-1]
+                         ) / close_tensor[:-1],
+                    ],
+                    dim=0,
+                )
+                result["pt_mom1"] = mom1.cpu().numpy()
+
+                # Calculate 5-day momentum
+                if len(close_tensor) >= 5:
+                    mom5 = torch.cat(
                         [
-                            tf.zeros(1),
-                            (close_tensor[1:] - close_tensor[:-1]
-                             ) / close_tensor[:-1],
+                            torch.zeros(5, device=device),
+                            (close_tensor[5:] - close_tensor[:-5])
+                            / close_tensor[:-5],
                         ],
-                        axis=0,
+                        dim=0,
                     )
-                    result["tf_mom1"] = mom1.numpy()
+                    result["pt_mom5"] = mom5.cpu().numpy()
 
-                    # Calculate 5-day momentum
-                    if len(close_tensor) >= 5:
-                        mom5 = tf.concat(
-                            [
-                                tf.zeros(5),
-                                (close_tensor[5:] - close_tensor[:-5])
-                                / close_tensor[:-5],
-                            ],
-                            axis=0,
-                        )
-                        result["tf_mom5"] = mom5.numpy()
-
-                    # Calculate 10-day momentum
-                    if len(close_tensor) >= 10:
-                        mom10 = tf.concat(
-                            [
-                                tf.zeros(10),
-                                (close_tensor[10:] - close_tensor[:-10])
-                                / close_tensor[:-10],
-                            ],
-                            axis=0,
-                        )
-                        result["tf_mom10"] = mom10.numpy()
-
-                    # Calculate volatility (standard deviation)
-                    if len(close_tensor) >= 10:
-                        volatility = []
-                        for i in range(len(close_tensor)):
-                            if i < 10:
-                                volatility.append(0.0)
-                            else:
-                                window = close_tensor[i - 10: i]
-                                std = tf.math.reduce_std(window)
-                                mean = tf.math.reduce_mean(window)
-                                vol = std / mean if mean != 0 else 0
-                                volatility.append(vol.numpy())
-                        result["tf_volatility"] = volatility
-
-                # If we have OHLC data, calculate candlestick patterns
-                if all(col in tensors for col in ["open", "high", "low", "close"]):
-                    open_tensor = tensors["open"]
-                    high_tensor = tensors["high"]
-                    low_tensor = tensors["low"]
-                    close_tensor = tensors["close"]
-
-                    # Calculate candlestick body size
-                    body_size = tf.abs(close_tensor - open_tensor)
-                    result["body_size"] = body_size.numpy()
-
-                    # Calculate upper shadow
-                    upper_shadow = tf.where(
-                        close_tensor > open_tensor,
-                        high_tensor - close_tensor,
-                        high_tensor - open_tensor,
+                # Calculate 10-day momentum
+                if len(close_tensor) >= 10:
+                    mom10 = torch.cat(
+                        [
+                            torch.zeros(10, device=device),
+                            (close_tensor[10:] - close_tensor[:-10])
+                            / close_tensor[:-10],
+                        ],
+                        dim=0,
                     )
-                    result["upper_shadow"] = upper_shadow.numpy()
+                    result["pt_mom10"] = mom10.cpu().numpy()
 
-                    # Calculate lower shadow
-                    lower_shadow = tf.where(
-                        close_tensor > open_tensor,
-                        open_tensor - low_tensor,
-                        close_tensor - low_tensor,
-                    )
-                    result["lower_shadow"] = lower_shadow.numpy()
+                # Calculate volatility (standard deviation)
+                if len(close_tensor) >= 10:
+                    volatility = []
+                    for i in range(len(close_tensor)):
+                        if i < 10:
+                            volatility.append(0.0)
+                        else:
+                            window = close_tensor[i - 10: i]
+                            std = torch.std(window)
+                            mean = torch.mean(window)
+                            vol = std / mean if mean != 0 else 0
+                            volatility.append(vol.item())
+                    result["pt_volatility"] = volatility
 
-                    # Identify potential doji patterns (small body relative to shadows)
-                    total_range = high_tensor - low_tensor
-                    doji_condition = body_size < (0.1 * total_range)
-                    result["is_doji"] = doji_condition.numpy().astype(int)
+            # If we have OHLC data, calculate candlestick patterns
+            if all(col in tensors for col in ["open", "high", "low", "close"]):
+                open_tensor = tensors["open"]
+                high_tensor = tensors["high"]
+                low_tensor = tensors["low"]
+                close_tensor = tensors["close"]
 
-                    # Identify potential hammer patterns (small body, long lower shadow)
-                    hammer_condition = tf.logical_and(
-                        body_size < (
-                            0.3 * total_range), lower_shadow > (2 * body_size),
-                    )
-                    result["is_hammer"] = hammer_condition.numpy().astype(int)
+                # Calculate candlestick body size
+                body_size = torch.abs(close_tensor - open_tensor)
+                result["body_size"] = body_size.cpu().numpy()
+
+                # Calculate upper shadow
+                upper_shadow = torch.where(
+                    close_tensor > open_tensor,
+                    high_tensor - close_tensor,
+                    high_tensor - open_tensor,
+                )
+                result["upper_shadow"] = upper_shadow.cpu().numpy()
+
+                # Calculate lower shadow
+                lower_shadow = torch.where(
+                    close_tensor > open_tensor,
+                    open_tensor - low_tensor,
+                    close_tensor - low_tensor,
+                )
+                result["lower_shadow"] = lower_shadow.cpu().numpy()
+
+                # Identify potential doji patterns (small body relative to shadows)
+                total_range = high_tensor - low_tensor
+                doji_condition = body_size < (0.1 * total_range)
+                result["is_doji"] = doji_condition.cpu().numpy().astype(int)
+
+                # Identify potential hammer patterns (small body, long lower shadow)
+                hammer_condition = torch.logical_and(
+                    body_size < (0.3 * total_range),
+                    lower_shadow > (2 * body_size)
+                )
+                result["is_hammer"] = hammer_condition.cpu().numpy().astype(int)
 
             return result
 
         except Exception as e:
-            logger.exception(f"Error in TensorFlow processing: {e}")
+            logger.exception(f"Error in PyTorch processing: {e}")
             return df
 
     # ===== DATA LOADING METHODS =====
@@ -1318,12 +1500,10 @@ class DataPipeline:
         try:
             # Use default market symbols if none provided
             if symbols is None:
-                # Use market index tickers from configuration
+                # Use market index tickers from DEFAULT_TICKERS
                 market_symbols = [
                     ticker
-                    for ticker in config["stock_selection"]["universe"][
-                        "default_tickers"
-                    ]
+                    for ticker in DEFAULT_TICKERS
                     if ticker in ["SPY", "QQQ", "IWM", "DIA"]
                 ]
                 # Fallback to SPY and QQQ if no market indices in default tickers
@@ -2127,10 +2307,10 @@ class DataPipeline:
         try:
             if self.test_mode:
                 logger.info(
-                    "Using default tickers from configuration for testing")
+                    "Using default tickers for testing")
                 return [
                     {"ticker": t}
-                    for t in config["stock_selection"]["universe"]["default_tickers"]
+                    for t in DEFAULT_TICKERS
                 ]
 
             # Use the v3 reference/tickers endpoint
@@ -2381,6 +2561,12 @@ class DataPipeline:
                     return "bearish"
                 if vix_price > 25:
                     return "volatile"
+                return "normal"
+            
+            return "normal"
+        except Exception as e:
+            logger.exception(f"Error determining market regime: {e}")
+            return "normal"
 
     async def get_current_price(self, ticker):
         """
@@ -2613,7 +2799,7 @@ class DataPipeline:
             # Use market index tickers from configuration
             market_symbols = [
                 ticker
-                for ticker in config["stock_selection"]["universe"]["default_tickers"]
+                for ticker in DEFAULT_TICKERS
                 if ticker in ["SPY", "QQQ", "IWM", "DIA"]
             ]
             # Fallback to SPY and QQQ if no market indices in default tickers

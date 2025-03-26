@@ -51,7 +51,6 @@ logger = logging.getLogger("api_clients")
 load_dotenv()
 
 # Third-party imports
-
 # Import GPU acceleration libraries with fallback
 try:
     import cupy as cp
@@ -59,6 +58,18 @@ try:
     CUPY_AVAILABLE = True
 except ImportError:
     CUPY_AVAILABLE = False
+    cp = None
+
+# Import ONNX with fallback
+try:
+    import onnx
+    ONNX_VERSION = onnx.__version__
+    ONNX_AVAILABLE = True
+    logger.info(f"Using ONNX version {ONNX_VERSION}")
+except ImportError:
+    ONNX_AVAILABLE = False
+    onnx = None
+    logger.warning("ONNX not available, model optimization will be limited")
     cp = None
 
 # Import PyTorch with fallback
@@ -1081,8 +1092,8 @@ class GPUAccelerator:
         # Initialize logger for this method
         logger = logging.getLogger("api_clients")
         
-        if not self.use_gpu or not self.torch_initialized or not TENSORRT_AVAILABLE:
-            logger.warning("TensorRT optimization not available")
+        if not self.use_gpu or not self.torch_initialized or not TENSORRT_AVAILABLE or not ONNX_AVAILABLE:
+            logger.warning(f"Model optimization not available: GPU={self.use_gpu}, PyTorch={self.torch_initialized}, TensorRT={TENSORRT_AVAILABLE}, ONNX={ONNX_AVAILABLE}")
             return None
 
         try:
@@ -1121,8 +1132,17 @@ class GPUAccelerator:
                 opset_version=13,
                 do_constant_folding=True,
             )
-            
             logger.info(f"Exported PyTorch model to ONNX: {onnx_path}")
+            
+            # Validate ONNX model
+            if ONNX_AVAILABLE:
+                try:
+                    onnx_model = onnx.load(onnx_path)
+                    onnx.checker.check_model(onnx_model)
+                    logger.info("ONNX model validation successful")
+                except Exception as e:
+                    logger.error(f"ONNX model validation failed: {e}")
+                    return None
 
             # Step 3: Use TensorRT to optimize the ONNX model
             import tensorrt as trt
@@ -1134,8 +1154,8 @@ class GPUAccelerator:
             
             with open(onnx_path, 'rb') as model_file:
                 if not parser.parse(model_file.read()):
-                    for error in range(parser.num_errors):
-                        logger.error(f"TensorRT ONNX parser error: {parser.get_error(error)}")
+                    for error_idx in range(parser.num_errors):
+                        logger.error(f"TensorRT ONNX parser error: {parser.get_error(error_idx)}")
                     raise RuntimeError("Failed to parse ONNX model")
             
             config = builder.create_builder_config()

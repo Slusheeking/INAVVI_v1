@@ -1,0 +1,31 @@
+# Core dependencies
+fastapi==0.115.12
+uvicorn==0.34.0
+python-dotenv==1.0.1
+aiohttp==3.9.3
+
+# Data processing
+numpy==1.26.4
+pandas==2.2.1
+scipy==1.15.2
+
+# Machine Learning
+xgboost==3.0.0
+scikit-learn==1.4.1.post1
+
+# GPU Acceleration
+torch==2.6.0
+cupy==13.4.0
+onnx==1.17.0
+tensorrt==10.3.0
+
+# Monitoring and metrics
+prometheus-client==0.19.0
+prometheus-fastapi-instrumentator==6.1.0
+
+# Redis integration
+redis==5.0.1
+redis-exporter==1.0.0
+
+# Utilities
+packaging==24.0
