@@ -1,0 +1,15 @@
+# Environment variables
+.env
+
+# Prometheus data
+prometheus-2.51.2.linux-arm64/data/
+
+# Log files
+*.log
+nohup.out
+
+# Cache and build
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/

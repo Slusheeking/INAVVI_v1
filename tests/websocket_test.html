@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WebSocket Test</title>
+    <style>
+        .log {
+            height: 300px;
+            overflow-y: auto;
+            border: 1px solid #ccc;
+            padding: 10px;
+            margin: 10px 0;
+        }
+        .redis-log, .file-log {
+            width: 45%;
+            float: left;
+            margin-right: 5%;
+        }
+    </style>
+</head>
+<body>
+    <h2>WebSocket Test</h2>
+    
+    <div class="redis-log">
+        <h3>Redis Updates</h3>
+        <div id="redisLog" class="log"></div>
+    </div>
+
+    <div class="file-log">
+        <h3>File Changes</h3>
+        <div id="fileLog" class="log"></div>
+    </div>
+
+    <script>
+        function appendLog(elementId, message) {
+            const log = document.getElementById(elementId);
+            const entry = document.createElement('div');
+            entry.textContent = new Date().toISOString() + ': ' + message;
+            log.appendChild(entry);
+            log.scrollTop = log.scrollHeight;
+        }
+
+        // Redis WebSocket
+        const redisSocket = new WebSocket('ws://localhost:8000/ws/redis');
+        redisSocket.onopen = () => appendLog('redisLog', 'Connected to Redis WebSocket');
+        redisSocket.onclose = () => appendLog('redisLog', 'Disconnected from Redis WebSocket');
+        redisSocket.onmessage = (event) => {
+            try {
+                const data = JSON.parse(event.data);
+                appendLog('redisLog', JSON.stringify(data, null, 2));
+            } catch (e) {
+                appendLog('redisLog', event.data);
+            }
+        };
+        redisSocket.onerror = (error) => appendLog('redisLog', 'Error: ' + error.message);
+
+        // Test Redis pub/sub
+        async function testRedisPublish() {
+            try {
+                const response = await fetch('http://localhost:8000/test-publish', {
+                    method: 'POST'
+                });
+                const result = await response.json();
+                console.log('Published test message:', result);
+            } catch (error) {
+                console.error('Error publishing test message:', error);
+            }
+        }
+
+        // Test file changes by creating a test file
+        async function testFileChange() {
+            try {
+                const response = await fetch('http://localhost:8000/test-file', {
+                    method: 'POST'
+                });
+                const result = await response.json();
+                console.log('Created test file:', result);
+            } catch (error) {
+                console.error('Error creating test file:', error);
+            }
+        }
+
+        // Add test buttons
+        document.body.innerHTML += `
+            <div style="clear: both; padding-top: 20px;">
+                <button onclick="testRedisPublish()">Test Redis Publish</button>
+                <button onclick="testFileChange()">Test File Change</button>
+            </div>
+        `;
+    </script>
+</body>
+</html>
