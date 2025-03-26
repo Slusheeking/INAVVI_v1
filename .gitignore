@@ -1,8 +1,18 @@
 # Environment variables
 .env
 
-# Prometheus data
+# Virtual environment
+venv/
+
+# Prometheus files
 prometheus-2.51.2.linux-arm64/data/
+prometheus-2.51.2.linux-arm64/prometheus
+prometheus-2.51.2.linux-arm64/promtool
+notes/prometheus-*.tar.gz
+
+# Redis exporter
+redis_exporter-*/
+notes/redis_exporter-*.tar.gz
 
 # Log files
 *.log
