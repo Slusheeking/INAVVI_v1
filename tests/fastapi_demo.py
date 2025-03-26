@@ -6,7 +6,13 @@ import json
 import os
 import time
 from datetime import datetime
+import uvicorn
+from dotenv import load_dotenv
 
+# Load environment variables
+load_dotenv()
+
+# Create FastAPI app
 app = FastAPI()
 r = redis.Redis(host='localhost', port=6379, decode_responses=True)
 
@@ -128,3 +134,7 @@ async def test_file():
 
 # Set up Prometheus metrics at /metrics
 Instrumentator().instrument(app).expose(app)
+
+# Run the application with Uvicorn when executed directly
+if __name__ == "__main__":
+    uvicorn.run("fastapi_demo:app", host="0.0.0.0", port=8000, reload=True)

@@ -34,7 +34,7 @@ import pandas as pd
 import redis
 import websockets
 from dotenv import load_dotenv
-from websockets.exceptions import ConnectionClosed, WebSocketException
+from websockets.exceptions import ConnectionClosed, WebSocketException  # noqa: F401 WebSocketException is used for exception handling
 
 # Configure logging with a more detailed format
 logging.basicConfig(
@@ -1078,6 +1078,9 @@ class GPUAccelerator:
         Returns:
             Path to optimized model or None if optimization failed
         """
+        # Initialize logger for this method
+        logger = logging.getLogger("api_clients")
+        
         if not self.use_gpu or not self.torch_initialized or not TENSORRT_AVAILABLE:
             logger.warning("TensorRT optimization not available")
             return None
@@ -2504,7 +2507,7 @@ class PolygonWebSocketClient:
                         logger.info(f"Successfully subscribed to: {params}")
                         if self.redis_client:
                             self._send_frontend_notification(
-                                message=f"Successfully subscribed to market data channels",
+                                message="Successfully subscribed to market data channels",
                                 level="success",
                                 category="websocket_subscription",
                                 details={
@@ -2518,7 +2521,7 @@ class PolygonWebSocketClient:
                             f"Successfully unsubscribed from: {params}")
                         if self.redis_client:
                             self._send_frontend_notification(
-                                message=f"Successfully unsubscribed from market data channels",
+                                message="Successfully unsubscribed from market data channels",
                                 level="info",
                                 category="websocket_subscription",
                                 details={
