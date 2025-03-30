@@ -2,22 +2,27 @@
 fastapi==0.115.12
 uvicorn==0.34.0
 python-dotenv==1.0.1
-aiohttp==3.9.3
+aiohttp==3.11.14
+websockets==15.0.1
+apscheduler==3.10.4 # Added for scheduling
 
 # Data processing
-numpy==1.26.4
+numpy==1.24.3  # Must use <2.0 for compatibility with current XGBoost and SciPy
 pandas==2.2.1
 scipy==1.15.2
 
 # Machine Learning
-xgboost==3.0.0
+# XGBoost with GPU support - built from source
+# Use the provided build_xgboost_gpu.sh script to build XGBoost 3.0.0 with CUDA support
+# The script will clone the repository, configure with CUDA support, and install the Python package
+# DO NOT install from PyPI as it lacks GPU support for the GH200 architecture
 scikit-learn==1.4.1.post1
 
 # GPU Acceleration
 torch==2.6.0
-cupy==13.4.0
+cupy-cuda12x==13.4.0  # CUDA 12.8 compatible
 onnx==1.17.0
-tensorrt==10.3.0
+/home/ubuntu/TensorRT-10.3.0.26/python/tensorrt-10.3.0-cp310-none-linux_aarch64.whl
 
 # Monitoring and metrics
 prometheus-client==0.19.0
@@ -25,7 +30,10 @@ prometheus-fastapi-instrumentator==6.1.0
 
 # Redis integration
 redis==5.0.1
-redis-exporter==1.0.0
+# Note: Redis Exporter v1.69.0 is installed as a binary at /usr/local/bin/redis_exporter
+# It was installed directly from GitHub: https://github.com/oliver006/redis_exporter/releases
 
 # Utilities
 packaging==24.0
+python-json-logger==2.0.7
+sentry-sdk==2.7.1

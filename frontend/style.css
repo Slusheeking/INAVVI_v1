@@ -1,0 +1,80 @@
+body {
+    font-family: sans-serif;
+    line-height: 1.6;
+    margin: 20px;
+    background-color: #f4f4f4;
+    color: #333;
+}
+
+h1, h2 {
+    color: #0056b3;
+}
+
+#status-container, #notifications-container {
+    background-color: #fff;
+    padding: 15px;
+    margin-bottom: 20px;
+    border-radius: 5px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+
+#status-content span {
+    display: block;
+    margin-bottom: 5px;
+}
+
+#status-content .status-running {
+    color: green;
+    font-weight: bold;
+}
+
+#status-content .status-stopped {
+    color: red;
+    font-weight: bold;
+}
+
+#notifications-list {
+    list-style: none;
+    padding: 0;
+    max-height: 400px;
+    overflow-y: auto;
+    border: 1px solid #ddd;
+    border-radius: 3px;
+}
+
+#notifications-list li {
+    padding: 10px;
+    border-bottom: 1px solid #eee;
+}
+
+#notifications-list li:last-child {
+    border-bottom: none;
+}
+
+#notifications-list .level-error {
+    color: #dc3545;
+    font-weight: bold;
+}
+
+#notifications-list .level-warning {
+    color: #ffc107;
+}
+
+#notifications-list .level-success {
+    color: #28a745;
+}
+
+#notifications-list .timestamp {
+    font-size: 0.8em;
+    color: #666;
+    display: block;
+    margin-top: 5px;
+}
+
+#notifications-list .details {
+    font-size: 0.9em;
+    color: #555;
+    margin-top: 5px;
+    white-space: pre-wrap; /* Preserve formatting in details */
+    word-break: break-all;
+}
