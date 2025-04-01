@@ -2,7 +2,7 @@
 import asyncio
 import time
 import random
-import logging
+from utils.logging_config import get_logger # Use configured logger
 import os
 import csv # For logging paper trades
 from pathlib import Path # For creating log directory
@@ -14,8 +14,8 @@ from datetime import datetime # For PnL timestamp
 # Need TradingEngine for type hint and access to redis/clients if passed directly
 from trading_engine.base import TradingEngine
 from stock_selection.base import TradeExecutionDetails, PositionInfo # Use shared types
-from utils.exceptions import TradingError, APIError # Use shared exceptions
-from utils.config import config # Use centralized config
+from utils.exceptions import TradingError, APIError as TradingAPIError, APIConnectionError, APITimeoutError # Use shared exceptions
+# from utils.config import config # Config is accessed via self.engine.config
 
 # Import a specific brokerage library (e.g., Alpaca)
 # Ensure this library is listed in requirements.txt
@@ -28,7 +28,7 @@ except ImportError:
     AlpacaAPIError = Exception # Define as base Exception if unavailable
     tradeapi = None
     TimeFrame = None # Define TimeFrame as None if unavailable
-    logging.getLogger(__name__).warning("alpaca-trade-api not found. LiveExecution will not function.")
+    get_logger(__name__).warning("alpaca-trade-api not found. LiveExecution will not function.") # Use configured logger
 
 
 # Define log directory and file path
@@ -49,7 +49,7 @@ def _setup_paper_trade_log():
                 writer = csv.DictWriter(f, fieldnames=PAPER_TRADE_LOG_FIELDNAMES)
                 writer.writeheader()
     except Exception as e:
-        logging.getLogger(__name__).error(f"Failed to setup paper trade log: {e}")
+        get_logger(__name__).error(f"Failed to setup paper trade log: {e}") # Use configured logger
 
 _setup_paper_trade_log() # Ensure log file is ready on module load
 
@@ -61,7 +61,7 @@ class ExecutionSystem(ABC):
     def __init__(self, engine: TradingEngine, config_override: Optional[Dict] = None):
         self.engine = engine
         self.config = config_override or {} # Allow overriding config for testing/specific instances
-        self.logger = logging.getLogger(self.__class__.__name__) # Use class name in logger
+        self.logger = get_logger(self.__class__.__name__) # Use configured logger
 
     @abstractmethod
     async def execute_order(self, order: Dict) -> TradeExecutionDetails:
@@ -105,16 +105,24 @@ class LiveExecution(ExecutionSystem):
         self._load_config()
 
     def _load_config(self):
-        """Load Alpaca credentials from centralized config or environment variables."""
-        cfg = self.config.get('alpaca', {})
-        self.api_key = cfg.get('api_key', os.environ.get("APCA_API_KEY_ID"))
-        self.secret_key = cfg.get('secret_key', os.environ.get("APCA_API_SECRET_KEY"))
-        self.base_url = cfg.get('base_url', os.environ.get("APCA_API_BASE_URL", "https://paper-api.alpaca.markets"))
-        self.data_url = cfg.get('data_url', os.environ.get("APCA_API_DATA_URL"))
-        if not self.api_key or not self.secret_key:
-            self.logger.error("Alpaca API Key ID or Secret Key not configured. LiveExecution disabled.")
-            self.api_key, self.secret_key = None, None
-        else: self.logger.info(f"Alpaca configured for base URL: {self.base_url}")
+        """Load Alpaca credentials from the engine's centralized config."""
+        # Access config via self.engine.config
+        self.api_key = self.engine.config.get("APCA_API_KEY_ID")
+        self.secret_key = self.engine.config.get("APCA_API_SECRET_KEY")
+        self.base_url = self.engine.config.get("APCA_API_BASE_URL", "https://paper-api.alpaca.markets") # Default to paper
+        # self.data_url = self.engine.config.get("APCA_API_DATA_URL") # Data URL often not needed for REST trading
+
+        # Validate required keys were found in the central config
+        if not self.api_key:
+            self.logger.error("APCA_API_KEY_ID not found in configuration. LiveExecution disabled.")
+        if not self.secret_key:
+             self.logger.error("APCA_API_SECRET_KEY not found in configuration. LiveExecution disabled.")
+
+        if self.api_key and self.secret_key:
+             self.logger.info(f"Alpaca LiveExecution configured for base URL: {self.base_url}")
+        else:
+             # Ensure keys are None if missing, preventing partial initialization
+             self.api_key, self.secret_key = None, None
 
     async def initialize(self):
         """Initialize the Alpaca API client."""
@@ -125,8 +133,22 @@ class LiveExecution(ExecutionSystem):
             self.api = tradeapi.REST(key_id=self.api_key, secret_key=self.secret_key, base_url=self.base_url, api_version='v2')
             account_info = await asyncio.get_event_loop().run_in_executor(None, self.api.get_account)
             self.logger.info(f"Alpaca connection successful. Account Status: {account_info.status}")
-        except AlpacaAPIError as e: self.logger.error(f"Alpaca API error during init: {e}"); self.api = None; raise TradingError(f"Alpaca init error: {e}") from e
-        except Exception as e: self.logger.exception(f"Unexpected error initializing Alpaca: {e}"); self.api = None; raise TradingError(f"Unexpected Alpaca init error: {e}") from e
+        # Catch more specific connection errors if possible, map to custom exceptions
+        except AlpacaAPIError as e:
+             # Check for common connection/auth issues
+             if "forbidden" in str(e).lower() or "unauthorized" in str(e).lower():
+                  err_type = TradingAPIError # Use the alias
+             else: # Assume other API errors for now
+                  err_type = TradingAPIError
+             self.logger.error(f"Alpaca API error during init: {e}", exc_info=True)
+             self.api = None
+             raise err_type(f"Alpaca init error: {e}") from e
+        except Exception as e: # Catch potential network errors from underlying requests library
+             # if isinstance(e, requests.exceptions.ConnectionError): # Example check
+             #      raise APIConnectionError(f"Alpaca connection failed: {e}") from e
+             self.logger.exception(f"Unexpected error initializing Alpaca: {e}")
+             self.api = None
+             raise TradingError(f"Unexpected Alpaca init error: {e}") from e
 
     async def execute_order(self, order: Dict) -> TradeExecutionDetails:
         """Execute order with Alpaca trading API."""
@@ -157,8 +179,15 @@ class LiveExecution(ExecutionSystem):
                 "timestamp": alpaca_order.submitted_at.timestamp() if alpaca_order.submitted_at else time.time(),
                 "error_message": None
             }
-        except AlpacaAPIError as e: self.logger.error(f"Alpaca API error executing order for {symbol}: {e}"); raise APIError(f"Alpaca API error: {e}") from e
-        except Exception as e: self.logger.exception(f"Unexpected error executing order via Alpaca for {symbol}: {e}"); raise TradingError(f"Unexpected order execution error: {e}") from e
+        except AlpacaAPIError as e:
+             # Check for specific actionable errors like insufficient funds, invalid order, etc.
+             msg = f"Alpaca API error executing order for {symbol}: {e}"
+             self.logger.error(msg)
+             raise TradingAPIError(msg) from e # Use alias
+        except Exception as e:
+             msg = f"Unexpected error executing order via Alpaca for {symbol}: {e}"
+             self.logger.exception(msg)
+             raise TradingError(msg) from e
 
     async def cancel_order(self, order_id: str) -> bool:
         """Cancel order with Alpaca trading API."""
@@ -171,8 +200,14 @@ class LiveExecution(ExecutionSystem):
         except AlpacaAPIError as e:
             if "order not found" in str(e).lower() or "already cancelled" in str(e).lower() or "cannot be cancelled" in str(e).lower():
                  self.logger.warning(f"Could not cancel Alpaca order {order_id} (may be final): {e}"); return False
-            else: self.logger.error(f"Alpaca API error cancelling order {order_id}: {e}"); raise APIError(f"Alpaca API cancel error: {e}") from e
-        except Exception as e: self.logger.exception(f"Unexpected error cancelling order via Alpaca for {order_id}: {e}"); raise TradingError(f"Unexpected cancel error: {e}") from e
+            else:
+                 msg = f"Alpaca API error cancelling order {order_id}: {e}"
+                 self.logger.error(msg)
+                 raise TradingAPIError(msg) from e # Use alias
+        except Exception as e:
+             msg = f"Unexpected error cancelling order via Alpaca for {order_id}: {e}"
+             self.logger.exception(msg)
+             raise TradingError(msg) from e
 
     async def get_positions(self) -> Dict[str, PositionInfo]:
         """Get current portfolio positions from Alpaca."""
@@ -193,8 +228,14 @@ class LiveExecution(ExecutionSystem):
                 except (ValueError, TypeError, AttributeError) as map_err: self.logger.error(f"Error mapping position {pos.symbol}: {map_err}. Data: {pos}"); continue
             self.logger.info(f"Fetched {len(positions)} positions from Alpaca.")
             return positions
-        except AlpacaAPIError as e: self.logger.error(f"Alpaca API error fetching positions: {e}"); raise APIError(f"Alpaca positions error: {e}") from e
-        except Exception as e: self.logger.exception(f"Unexpected error fetching positions via Alpaca: {e}"); raise TradingError(f"Unexpected positions error: {e}") from e
+        except AlpacaAPIError as e:
+             msg = f"Alpaca API error fetching positions: {e}"
+             self.logger.error(msg)
+             raise TradingAPIError(msg) from e # Use alias
+        except Exception as e:
+             msg = f"Unexpected error fetching positions via Alpaca: {e}"
+             self.logger.exception(msg)
+             raise TradingError(msg) from e
 
     async def get_order_status(self, order_id: str) -> Optional[TradeExecutionDetails]:
          """Get the status of a specific order from Alpaca."""
@@ -220,8 +261,14 @@ class LiveExecution(ExecutionSystem):
              }
          except AlpacaAPIError as e:
              if e.status_code == 404: self.logger.warning(f"Alpaca order not found: {order_id}"); return None
-             else: self.logger.error(f"Alpaca API error getting order {order_id}: {e}"); raise APIError(f"Alpaca order status error: {e}") from e
-         except Exception as e: self.logger.exception(f"Unexpected error getting order status via Alpaca for {order_id}: {e}"); raise TradingError(f"Unexpected order status error: {e}") from e
+             else:
+                  msg = f"Alpaca API error getting order {order_id}: {e}"
+                  self.logger.error(msg)
+                  raise TradingAPIError(msg) from e # Use alias
+         except Exception as e:
+              msg = f"Unexpected error getting order status via Alpaca for {order_id}: {e}"
+              self.logger.exception(msg)
+              raise TradingError(msg) from e
 
     async def close(self):
         await super().close()

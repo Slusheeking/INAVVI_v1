@@ -27,15 +27,8 @@ import traceback
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Union
 
-# Import configuration module if available
-try:
-    from config import config, get_config
-except ImportError:
-    # Fallback if config module is not available
-    config = None
-    
-    def get_config():
-        return None
+# Import configuration module
+from .config import config, get_config
 
 
 # Default log format

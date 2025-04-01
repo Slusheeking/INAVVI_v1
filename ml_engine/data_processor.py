@@ -19,7 +19,7 @@ import logging
 import os
 import pickle
 import time
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
@@ -28,6 +28,13 @@ from sklearn.preprocessing import MinMaxScaler
 
 from ml_engine.utils import select_features, create_time_series_splits
 from utils.logging_config import get_logger
+from utils.config import Config # Import Config
+from utils.exceptions import DataError, ConfigurationError, RedisError # Import custom exceptions
+
+# Type hints for injected dependencies
+if TYPE_CHECKING:
+    from data_pipeline.base import DataPipeline
+    from utils.redis_helpers import RedisClient
 
 # Configure logging
 logger = get_logger("ml_engine.data_processor")
@@ -45,19 +52,44 @@ except ImportError:
 class MLDataProcessor:
     """Data processor for ML model training"""
 
-    def __init__(self, data_loader, redis_client=None, config=None) -> None:
+    def __init__(self, config: Config, data_loader: 'DataPipeline', redis_client: Optional['RedisClient'] = None) -> None:
         """
         Initialize data processor
-        
+
         Args:
-            data_loader: Data loader instance
-            redis_client: Redis client for caching and notifications
-            config: Configuration dictionary
+            config: Centralized configuration object.
+            data_loader: Data loader instance (assumed to be DataPipeline).
+            redis_client: Optional shared Redis client instance.
         """
-        self.data_loader = data_loader
-        self.redis = redis_client
         self.config = config
-        self.reference_data = None
+        self.data_loader = data_loader # Assumes DataPipeline interface
+        self.redis = redis_client
+        self.logger = get_logger(__name__) # Use configured logger
+        self.reference_data: Optional[pd.DataFrame] = None # Add type hint
+
+        # Load config values needed by this processor
+        self.monitoring_dir = self.config.get_path("MONITORING_DIR", "./monitoring")
+        self.lookback_days = self.config.get_int("ML_LOOKBACK_DAYS", 30)
+        self.feature_selection_config = self.config.get_dict("ML_FEATURE_SELECTION", {})
+        self.time_series_cv_config = self.config.get_dict("ML_TIME_SERIES_CV", {})
+        self.monitoring_config = self.config.get_dict("ML_MONITORING", {})
+
+        # Load feature lists from config
+        self.signal_feature_cols = self.config.get_list("ML_SIGNAL_FEATURES", [])
+        self.price_feature_cols = self.config.get_list("ML_PRICE_FEATURES", [])
+        self.price_target_cols = self.config.get_list("ML_PRICE_TARGETS", [])
+
+        # Load Redis keys from config
+        self.redis_notify_key = self.config.get("REDIS_KEY_NOTIFICATIONS", "frontend:notifications")
+        self.redis_notify_limit = self.config.get_int("REDIS_LIMIT_NOTIFICATIONS", 100)
+        self.redis_category_limit = self.config.get_int("REDIS_LIMIT_CATEGORY", 50)
+        self.redis_drift_key = self.config.get("REDIS_KEY_DRIFT", "frontend:drift_detection") # Specific key for drift
+
+        # Ensure monitoring directory exists
+        try:
+            self.monitoring_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+             raise ConfigurationError(f"Failed to create monitoring directory {self.monitoring_dir}: {e}") from e
 
     def load_historical_data(self):
         """
@@ -68,7 +100,8 @@ class MLDataProcessor:
         """
         try:
             # Get lookback days from config
-            lookback_days = self.config.get("lookback_days", 30)
+            # Use loaded config value
+            lookback_days = self.lookback_days
 
             # Calculate date range
             end_date = datetime.datetime.now()
@@ -105,10 +138,12 @@ class MLDataProcessor:
                 f"Loaded historical data: {len(combined_data)} samples")
             return combined_data
 
-        except Exception as e:
-            logger.error(
-                f"Error loading historical data: {e!s}", exc_info=True)
-            return None
+        except DataError as e: # Catch specific data errors from loader
+             self.logger.error(f"Data loading error in MLDataProcessor: {e}", exc_info=True)
+             raise # Re-raise to signal failure upstream
+        except Exception as e: # Catch unexpected errors
+            self.logger.error(f"Unexpected error loading historical data: {e}", exc_info=True)
+            raise DataError("Failed to load historical data") from e # Wrap in DataError
 
     def store_reference_data(self, data) -> bool | None:
         """
@@ -124,22 +159,22 @@ class MLDataProcessor:
             # Create a copy to avoid modifying the original
             self.reference_data = data.copy()
 
-            # Save to disk for persistence
-            if self.config and "monitoring_dir" in self.config:
-                # Ensure directory exists
-                os.makedirs(self.config["monitoring_dir"], exist_ok=True)
-                
-                ref_path = os.path.join(
-                    self.config["monitoring_dir"], "reference_data.pkl",
-                )
-                with open(ref_path, "wb") as f:
-                    pickle.dump(self.reference_data, f)
+            # Save to disk using configured path
+            # Directory existence checked in __init__
+            ref_path = self.monitoring_dir / "reference_data.pkl"
+            try:
+                 with open(ref_path, "wb") as f:
+                     pickle.dump(self.reference_data, f)
+            except (pickle.PicklingError, OSError, IOError) as e:
+                 self.logger.error(f"Failed to save reference data to {ref_path}: {e}", exc_info=True)
+                 # Decide if this is critical - maybe just log and continue?
+                 return False # Indicate failure
 
             logger.info(
                 f"Stored reference data: {len(self.reference_data)} samples")
             return True
         except Exception as e:
-            logger.error(f"Error storing reference data: {e!s}", exc_info=True)
+            logger.error(f"Error storing reference data: {e}", exc_info=True)
             return False
 
     def prepare_signal_detection_data(self, data):
@@ -153,44 +188,11 @@ class MLDataProcessor:
             Tuple of (features, target) DataFrames
         """
         try:
-            # Select features
-            feature_columns = [
-                # Price-based features
-                "close",
-                "open",
-                "high",
-                "low",
-                "volume",
-                # Technical indicators
-                "sma5",
-                "sma10",
-                "sma20",
-                "ema5",
-                "ema10",
-                "ema20",
-                "macd",
-                "macd_signal",
-                "macd_hist",
-                "price_rel_sma5",
-                "price_rel_sma10",
-                "price_rel_sma20",
-                "mom1",
-                "mom5",
-                "mom10",
-                "volatility",
-                "volume_ratio",
-                "rsi",
-                "bb_width",
-                # Market features (if available)
-                "spy_close",
-                "vix_close",
-                "spy_change",
-                "vix_change",
-                # Options features (if available)
-                "put_call_ratio",
-                "implied_volatility",
-                "option_volume",
-            ]
+            # Use feature list loaded from config
+            feature_columns = self.signal_feature_cols
+            if not feature_columns:
+                 self.logger.error("ML_SIGNAL_FEATURES configuration is missing or empty.")
+                 raise ConfigurationError("Signal detection features not configured.")
 
             # Keep only available columns
             available_columns = [
@@ -225,10 +227,9 @@ class MLDataProcessor:
             return X, y
 
         except Exception as e:
-            logger.error(
-                f"Error preparing signal detection data: {e!s}", exc_info=True,
-            )
-            return pd.DataFrame(), pd.Series()
+            logger.error(f"Error preparing signal detection data: {e}", exc_info=True)
+            # Raise specific error?
+            raise DataError("Failed to prepare signal detection data") from e
 
     def prepare_price_prediction_data(self, data):
         """
@@ -241,24 +242,11 @@ class MLDataProcessor:
             Tuple of (sequences, targets) numpy arrays
         """
         try:
-            # Select features
-            feature_columns = [
-                # Price-based features
-                "close",
-                "high",
-                "low",
-                "volume",
-                # Technical indicators
-                "price_rel_sma5",
-                "price_rel_sma10",
-                "price_rel_sma20",
-                "macd",
-                "rsi",
-                "volatility",
-                # Market features (if available)
-                "spy_close",
-                "vix_close",
-            ]
+            # Use feature list loaded from config
+            feature_columns = self.price_feature_cols
+            if not feature_columns:
+                 self.logger.error("ML_PRICE_FEATURES configuration is missing or empty.")
+                 raise ConfigurationError("Price prediction features not configured.")
 
             # Keep only available columns
             available_columns = [
@@ -270,11 +258,11 @@ class MLDataProcessor:
                 return np.array([]), np.array([])
 
             # Target columns
-            target_columns = [
-                "future_return_5min",
-                "future_return_10min",
-                "future_return_30min",
-            ]
+            # Use target list loaded from config
+            target_columns = self.price_target_cols
+            if not target_columns:
+                 self.logger.error("ML_PRICE_TARGETS configuration is missing or empty.")
+                 raise ConfigurationError("Price prediction targets not configured.")
             available_targets = [
                 col for col in target_columns if col in data.columns]
 
@@ -350,10 +338,8 @@ class MLDataProcessor:
             return X_array, y_array
 
         except Exception as e:
-            logger.error(
-                f"Error preparing price prediction data: {e!s}", exc_info=True,
-            )
-            return np.array([]), np.array([])
+            logger.error(f"Error preparing price prediction data: {e}", exc_info=True)
+            raise DataError("Failed to prepare price prediction data") from e
 
     def create_time_series_splits(self, X, y):
         """
@@ -369,8 +355,8 @@ class MLDataProcessor:
         return create_time_series_splits(
             X,
             y,
-            self.config["time_series_cv"]["n_splits"],
-            self.config["time_series_cv"]["embargo_size"],
+            self.time_series_cv_config.get("n_splits", 5),
+            self.time_series_cv_config.get("embargo_size", 10),
         )
 
     def select_features(self, X, y, problem_type="classification"):
@@ -389,9 +375,9 @@ class MLDataProcessor:
             X,
             y,
             problem_type,
-            self.config["feature_selection"]["method"],
-            self.config["feature_selection"]["threshold"],
-            self.config["feature_selection"]["n_features"],
+            self.feature_selection_config.get("method", "importance"),
+            self.feature_selection_config.get("threshold", 0.01),
+            self.feature_selection_config.get("n_features", 20),
         )
 
     def detect_drift(self, current_data):
@@ -418,7 +404,7 @@ class MLDataProcessor:
                 drift_detected, drift_features = detect_feature_drift(
                     current_data,
                     self.reference_data,
-                    self.config["monitoring"]["drift_threshold"],
+                    self.monitoring_config.get("drift_threshold", 0.05),
                 )
 
                 # Record the result in Prometheus
@@ -445,26 +431,24 @@ class MLDataProcessor:
                             "details": {
                                 "drift_features": drift_features,
                                 "detection_time": detection_time,
-                                "threshold": self.config["monitoring"]["drift_threshold"],
+                                "threshold": self.monitoring_config.get("drift_threshold", 0.05),
                                 "total_features": len(current_data.columns)
                             }
                         }
 
                         # Push to notifications list
-                        self.redis.lpush("frontend:notifications",
-                                         json.dumps(notification))
-                        self.redis.ltrim("frontend:notifications", 0, 99)
+                        # Use configured keys and limits
+                        self.redis.lpush(self.redis_notify_key, json.dumps(notification))
+                        self.redis.ltrim(self.redis_notify_key, 0, self.redis_notify_limit - 1)
 
                         # Also store in drift_detection category
-                        self.redis.lpush(
-                            "frontend:drift_detection", json.dumps(notification))
-                        self.redis.ltrim("frontend:drift_detection", 0, 49)
+                        self.redis.lpush(self.redis_drift_key, json.dumps(notification))
+                        self.redis.ltrim(self.redis_drift_key, 0, self.redis_category_limit - 1)
 
                         logger.warning(
                             f"Drift detection notification sent to frontend: {len(drift_features)} features affected")
                     except Exception as e:
-                        logger.error(
-                            f"Error sending drift detection notification: {e}")
+                        logger.error(f"Error sending drift detection notification: {e}", exc_info=True)
 
                 return drift_detected, drift_features
             except Exception as e:
@@ -478,14 +462,14 @@ class MLDataProcessor:
                 return detect_feature_drift(
                     current_data,
                     self.reference_data,
-                    self.config["monitoring"]["drift_threshold"],
+                    self.monitoring_config.get("drift_threshold", 0.05),
                 )
         else:
             # Regular drift detection without Prometheus
             return detect_feature_drift(
                 current_data,
                 self.reference_data,
-                self.config["monitoring"]["drift_threshold"],
+                self.monitoring_config.get("drift_threshold", 0.05),
             )
 
 
@@ -529,5 +513,8 @@ def detect_feature_drift(current_data, reference_data, threshold=0.05):
         return drift_detected, drift_features
 
     except Exception as e:
-        logger.exception(f"Error detecting feature drift: {e!s}")
+        logger.exception(f"Error detecting feature drift: {e}")
+        # Don't suppress the error entirely, maybe return None or raise?
+        # Returning False might mask underlying issues.
+        # For now, keep original behavior but log exception.
         return False, {}

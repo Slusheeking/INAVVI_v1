@@ -20,17 +20,20 @@ import os
 import sys
 import time
 from typing import Any, Dict, List, Optional, Union
+import redis # Keep for type hint if needed, but use RedisClient
 
 from dotenv import load_dotenv
 
 from ml_engine.base import MLModelTrainer
+from data_pipeline.main import DataPipeline # Import DataPipeline at top level
 from utils.logging_config import get_logger
-
-# Load environment variables
-load_dotenv()
+from utils.config import get_config, Config # Import config system
+from utils.redis_helpers import RedisClient # Import shared Redis client
+from utils.exceptions import ConfigurationError, RedisConnectionError, DataError # Import custom exceptions
 
 # Configure logging
 logger = get_logger("ml_engine.main")
+# load_dotenv() # Handled by Config initialization if needed
 
 
 def parse_args():
@@ -42,92 +45,92 @@ def parse_args():
     return parser.parse_args()
 
 
-def initialize_redis():
-    """Initialize Redis client"""
-    try:
-        import redis
-        
-        redis_client = redis.Redis(
-            host=os.environ.get("REDIS_HOST", "localhost"),
-            port=int(os.environ.get("REDIS_PORT", 6380)),
-            db=int(os.environ.get("REDIS_DB", 0)),
-            username=os.environ.get("REDIS_USERNAME", "default"),
-            password=os.environ.get("REDIS_PASSWORD", "trading_system_2025"),
-        )
-        
-        # Test connection
-        redis_client.ping()
-        logger.info("Connected to Redis successfully")
-        return redis_client
-    except Exception as e:
-        logger.error(f"Error connecting to Redis: {e}")
-        return None
+# Removed initialize_redis function - use RedisClient directly
 
 
-def initialize_data_loader(redis_client):
-    """Initialize data loader"""
+def initialize_data_loader(config: Config, redis_client: RedisClient) -> Optional['DataPipeline']:
+    """Initialize data loader using Config and shared RedisClient."""
+    # Assuming DataPipeline is refactored to accept config and redis_client
     try:
-        from data_pipeline import DataPipeline
-        
-        data_loader = DataPipeline(
-            redis_client=redis_client,
-            polygon_client=None,  # Will be initialized by DataPipeline
-            polygon_ws=None,      # Will be initialized by DataPipeline
-            unusual_whales_client=None,  # Will be initialized by DataPipeline
-            use_gpu=os.environ.get("USE_GPU", "true").lower() == "true",
-        )
-        
+        # Import moved to top level
+
+        # DataPipeline should ideally take config and redis_client
+        # and initialize its own dependencies (like Polygon clients) based on config.
+        data_loader = DataPipeline(config=config, redis_client=redis_client)
+        # await data_loader.initialize() # If DataPipeline has async init
+
         logger.info("Data loader initialized successfully")
         return data_loader
+    except ImportError as e:
+         logger.error(f"Failed to import DataPipeline: {e}. Ensure data_pipeline module is correctly structured.")
+         return None
     except Exception as e:
-        logger.error(f"Error initializing data loader: {e}")
+        logger.error(f"Error initializing data loader: {e}", exc_info=True)
         return None
 
 
-def run_diagnostics():
-    """Run GPU diagnostics"""
+def run_gpu_diagnostics(config: Config) -> Dict[str, Any]:
+    """Run GPU diagnostics using config."""
     try:
-        from utils.gpu_utils import run_diagnostics
-        
-        diagnostics_results = run_diagnostics()
+        from utils.gpu_utils import run_diagnostics as run_gpu_diag_util
+
+        # Pass config to the utility function if it accepts it
+        # diagnostics_results = run_gpu_diag_util(config=config)
+        diagnostics_results = run_gpu_diag_util() # Assuming it uses global config or env vars for now
         logger.info("GPU diagnostics completed")
-        
+
         # Log diagnostics results
         for key, value in diagnostics_results.items():
             if isinstance(value, dict):
                 logger.info(f"{key}: {json.dumps(value, indent=2)}")
             else:
                 logger.info(f"{key}: {value}")
-                
+
         return diagnostics_results
+    except ImportError as e:
+         logger.warning(f"Could not import GPU diagnostics utility: {e}")
+         return {"error": "GPU diagnostics utility not found"}
     except Exception as e:
-        logger.error(f"Error running diagnostics: {e}")
-        return {}
+        logger.error(f"Error running diagnostics: {e}", exc_info=True)
+        return {"error": str(e)}
 
 
 def main():
     """Main entry point"""
     try:
+        # Get centralized configuration
+        config = get_config()
+
         # Parse command line arguments
         args = parse_args()
         
         # Run diagnostics
-        diagnostics_results = run_diagnostics()
-        
-        # Initialize Redis
-        redis_client = initialize_redis()
-        if not redis_client:
-            logger.error("Failed to initialize Redis, exiting")
+        # Run diagnostics (passing config)
+        diagnostics_results = run_gpu_diagnostics(config)
+
+        # Initialize shared RedisClient using config
+        try:
+            redis_client = RedisClient(config=config)
+            # Ensure connection works (optional, RedisClient might do lazy init)
+            # await redis_client.ensure_initialized() # If RedisClient has async init
+            # await redis_client.ping() # Or a simple ping
+            logger.info("RedisClient initialized successfully.")
+        except (RedisConnectionError, ConfigurationError) as e:
+            logger.error(f"Failed to initialize RedisClient: {e}", exc_info=True)
             return 1
             
         # Initialize data loader
-        data_loader = initialize_data_loader(redis_client)
+        # Initialize data loader (passing config and redis_client)
+        data_loader = initialize_data_loader(config, redis_client)
         if not data_loader:
-            logger.error("Failed to initialize data loader, exiting")
+            logger.error("Failed to initialize data loader, exiting.")
+            # Consider sending error notification here too
             return 1
             
         # Create model trainer
-        model_trainer = MLModelTrainer(redis_client, data_loader)
+        # Create model trainer (assuming it's refactored to accept config, redis, data_loader)
+        # model_trainer = MLModelTrainer(config=config, redis_client=redis_client, data_loader=data_loader)
+        model_trainer = MLModelTrainer(redis_client, data_loader) # Keep original for now if not refactored
         
         # Send system startup notification to frontend
         try:
@@ -164,8 +167,10 @@ def main():
             redis_client.set("frontend:system:status", json.dumps(system_status))
             
             logger.info("Startup notification sent to frontend")
-        except Exception as e:
-            logger.error(f"Error sending startup notification: {e}")
+        except redis.RedisError as e: # Catch specific Redis errors
+            logger.error(f"Redis error sending startup notification: {e}", exc_info=True)
+        except Exception as e: # Catch other unexpected errors
+            logger.error(f"Unexpected error sending startup notification: {e}", exc_info=True)
         
         # Process command line arguments
         if args.optimize:
@@ -191,8 +196,14 @@ def main():
         logger.info("ML Engine completed successfully")
         return 0
         
-    except Exception as e:
-        logger.error(f"Error in main execution: {e}", exc_info=True)
+    except ConfigurationError as e:
+         logger.error(f"Configuration error during execution: {e}", exc_info=True)
+    except DataError as e:
+         logger.error(f"Data processing error during execution: {e}", exc_info=True)
+    except redis.RedisError as e:
+         logger.error(f"Redis error during execution: {e}", exc_info=True)
+    except Exception as e: # General fallback
+        logger.error(f"Unexpected error in main execution: {e}", exc_info=True)
         
         # Send error notification to frontend
         if 'redis_client' in locals() and redis_client:
@@ -226,8 +237,10 @@ def main():
                 redis_client.set("frontend:system:status", json.dumps(system_status))
                 
                 logger.info("Error notification sent to frontend")
-            except Exception as notify_error:
-                logger.error(f"Error sending error notification: {notify_error}")
+            except redis.RedisError as notify_error: # Catch specific Redis errors
+                logger.error(f"Redis error sending error notification: {notify_error}", exc_info=True)
+            except Exception as notify_error: # Catch other unexpected errors
+                logger.error(f"Unexpected error sending error notification: {notify_error}", exc_info=True)
                 
         return 1
 

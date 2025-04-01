@@ -1,50 +1,121 @@
+/* VS Code Dark Theme Inspired Styles */
 body {
-    font-family: sans-serif;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
     line-height: 1.6;
-    margin: 20px;
-    background-color: #f4f4f4;
-    color: #333;
+    margin: 0; /* Remove default margin */
+    padding: 20px; /* Add padding */
+    background-color: #1e1e1e; /* Dark background */
+    color: #d4d4d4; /* Light text */
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
 }
 
 h1, h2 {
-    color: #0056b3;
+    color: #007acc; /* VS Code blue for headers */
+    border-bottom: 1px solid #3c3c3c; /* Subtle separator */
+    padding-bottom: 10px;
+    margin-top: 0; /* Adjust spacing */
 }
 
-#status-container, #notifications-container {
-    background-color: #fff;
-    padding: 15px;
+h1 {
+    text-align: center;
+    margin-bottom: 30px;
+}
+
+/* Grid layout for main sections */
+.main-content {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); /* Responsive columns */
+    gap: 20px;
+    flex-grow: 1;
+}
+
+/* General container styling */
+.container {
+    background-color: #252526; /* Slightly lighter dark background for containers */
+    padding: 20px;
     margin-bottom: 20px;
-    border-radius: 5px;
-    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    border-radius: 8px;
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2); /* Subtle shadow */
+    border: 1px solid #3c3c3c; /* Subtle border */
+    display: flex;
+    flex-direction: column;
+}
+
+.container h2 {
+    margin-top: 0;
+    margin-bottom: 15px;
+    padding-bottom: 5px;
+    border-bottom-color: #4a4a4a; /* Slightly lighter border for headers within containers */
+}
+
+/* Status Container Specifics */
+#status-container {
+    /* Inherits .container styles */
 }
 
 #status-content span {
     display: block;
-    margin-bottom: 5px;
+    margin-bottom: 8px;
+    font-size: 1.1em;
+}
+
+#status-content .status-label {
+    font-weight: bold;
+    color: #007acc; /* Blue label */
+    margin-right: 10px;
 }
 
 #status-content .status-running {
-    color: green;
+    color: #388e3c; /* Darker green */
     font-weight: bold;
 }
 
 #status-content .status-stopped {
-    color: red;
+    color: #d16969; /* Darker red */
     font-weight: bold;
+}
+
+/* Notifications Container Specifics */
+#notifications-container {
+    /* Inherits .container styles */
+    flex-grow: 1; /* Allow notifications to take more space if needed */
 }
 
 #notifications-list {
     list-style: none;
     padding: 0;
-    max-height: 400px;
+    margin: 0; /* Remove default margin */
+    max-height: 500px; /* Increased height */
     overflow-y: auto;
-    border: 1px solid #ddd;
-    border-radius: 3px;
+    border: 1px solid #3c3c3c; /* Darker border */
+    border-radius: 4px;
+    background-color: #1e1e1e; /* Match body background */
+    flex-grow: 1; /* Allow list to fill container */
+}
+
+/* Custom scrollbar for notifications */
+#notifications-list::-webkit-scrollbar {
+    width: 8px;
+}
+
+#notifications-list::-webkit-scrollbar-track {
+    background: #252526;
+    border-radius: 4px;
+}
+
+#notifications-list::-webkit-scrollbar-thumb {
+    background-color: #555;
+    border-radius: 4px;
+    border: 2px solid #252526;
 }
 
 #notifications-list li {
-    padding: 10px;
-    border-bottom: 1px solid #eee;
+    padding: 12px 15px;
+    border-bottom: 1px solid #3c3c3c; /* Darker separator */
+    display: flex;
+    flex-direction: column;
 }
 
 #notifications-list li:last-child {
@@ -52,29 +123,87 @@ h1, h2 {
 }
 
 #notifications-list .level-error {
-    color: #dc3545;
+    color: #f48771; /* Brighter red for visibility */
     font-weight: bold;
 }
 
 #notifications-list .level-warning {
-    color: #ffc107;
+    color: #cca700; /* VS Code warning yellow */
 }
 
 #notifications-list .level-success {
-    color: #28a745;
+    color: #89d185; /* Brighter green */
+}
+
+#notifications-list .level-info {
+    color: #75beff; /* Lighter blue for info */
+}
+
+#notifications-list .message-content {
+    margin-bottom: 5px;
 }
 
 #notifications-list .timestamp {
-    font-size: 0.8em;
-    color: #666;
-    display: block;
-    margin-top: 5px;
+    font-size: 0.85em;
+    color: #808080; /* Grey for timestamp */
+    align-self: flex-end; /* Align timestamp to the right */
 }
 
 #notifications-list .details {
     font-size: 0.9em;
-    color: #555;
-    margin-top: 5px;
-    white-space: pre-wrap; /* Preserve formatting in details */
-    word-break: break-all;
+    color: #a0a0a0; /* Lighter grey for details */
+    margin-top: 8px;
+    padding: 8px;
+    background-color: #2c2c2d; /* Slightly different background for details block */
+    border-radius: 4px;
+    border: 1px solid #3c3c3c;
+    white-space: pre-wrap;
+    word-break: break-word; /* Changed from break-all */
+    max-height: 150px; /* Limit details height */
+    overflow-y: auto; /* Add scroll if details are long */
+}
+
+/* Placeholder styles for new sections */
+#metrics-container, #reports-container, #prometheus-container {
+    /* Inherits .container styles */
+    /* Add specific styles as needed */
+}
+
+/* Style for placeholder content */
+.placeholder-content {
+    color: #808080;
+    text-align: center;
+    padding: 20px;
+    font-style: italic;
+    flex-grow: 1; /* Allow placeholder to fill container */
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+/* Basic table styling */
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 15px;
+}
+
+th, td {
+    border: 1px solid #3c3c3c;
+    padding: 10px;
+    text-align: left;
+}
+
+th {
+    background-color: #333; /* Darker header for tables */
+    color: #007acc; /* Blue text for table headers */
+    font-weight: bold;
+}
+
+tr:nth-child(even) {
+    background-color: #2a2a2b; /* Subtle striping for table rows */
+}
+
+tr:hover {
+    background-color: #3c3c3c; /* Highlight on hover */
 }

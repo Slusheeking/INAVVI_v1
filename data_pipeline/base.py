@@ -18,13 +18,14 @@ import pandas as pd
 # Use the singleton gpu_manager and helper functions
 from utils.gpu_utils import gpu_manager, get_device_info, is_gpu_available
 from utils.logging_config import get_logger
-
+from utils.config import Config # Import Config
+from utils.exceptions import ConfigurationError, APIError, RedisError, DataError # Import custom exceptions
 # Import functions from other pipeline modules
 from .loading import load_from_cache, save_to_cache
 from .processing import clean_market_data # Keep processing imports if needed by access methods
 
 # Configure logging
-logger = get_logger("data_pipeline")
+logger = get_logger("data_pipeline.base") # More specific logger name
 
 class DataPipeline:
     """
@@ -43,30 +44,31 @@ class DataPipeline:
 
     def __init__(
         self,
+        config: Config, # Require central Config object
+        redis_client, # Require shared RedisClient
+        # Clients are still injected for now, but could be initialized here based on config
         polygon_client=None,
         polygon_ws=None,
         unusual_whales_client=None,
-        redis_client=None,
-        config=None,
-        # Removed use_gpu, use_gh200 - handled by gpu_manager
-        test_mode=False,
+        test_mode=False, # Keep test_mode flag
     ) -> None:
         """
         Initialize the data pipeline
 
         Args:
-            polygon_client: Polygon API client
-            polygon_ws: Polygon WebSocket client
-            unusual_whales_client: Unusual Whales API client
-            redis_client: Redis client for caching
-            config: Configuration parameters (dict or loaded from config.py)
-            test_mode: Whether to use mock data for testing
+            config: Centralized configuration object.
+            redis_client: Shared Redis client instance.
+            polygon_client: Optional pre-initialized Polygon REST client.
+            polygon_ws: Optional pre-initialized Polygon WebSocket client.
+            unusual_whales_client: Optional pre-initialized Unusual Whales client.
+            test_mode: Whether to use mock data for testing.
         """
+        self.config = config
+        self.logger = get_logger(__name__) # Use configured logger
         self.polygon = polygon_client
         self.polygon_ws = polygon_ws
         self.unusual_whales = unusual_whales_client
-        self.redis = redis_client
-
+        self.redis = redis_client # Use injected shared client
         # Test mode for using synthetic data
         self.test_mode = test_mode
 
@@ -74,46 +76,28 @@ class DataPipeline:
         self.use_gpu = is_gpu_available() # Check status from gpu_manager
         self.gpu_info = get_device_info() # Get detailed info if needed
 
-        # Default configuration
-        self.default_config = {
-            "cache_dir": os.environ.get("DATA_CACHE_DIR", "./data/cache"),
-            "cache_expiry": 86400,  # 1 day in seconds
-            "rate_limit": {
-                "polygon": 5,  # requests per second
-                "unusual_whales": 2,  # requests per second
-            },
-            "retry_settings": {
-                "stop_max_attempt_number": 3,
-                "wait_exponential_multiplier": 1000,
-                "wait_exponential_max": 10000,
-            },
-            "data_dir": os.environ.get("DATA_DIR", "./data"),
-            "monitoring_dir": os.environ.get("MONITORING_DIR", "./monitoring"),
-            "min_samples": 1000,
-            "lookback_days": 30,
-            "monitoring": {"enabled": True, "drift_threshold": 0.05},
-            "feature_selection": {
-                "enabled": True,
-                "method": "importance",
-                "threshold": 0.01,
-                "n_features": 20,
-            },
-            "time_series_cv": {"n_splits": 5, "embargo_size": 10},
-            "watchlist": {
-                "refresh_interval": 900,  # 15 minutes
-                "max_size": 100,
-                "min_price": 5.0,
-                "min_volume": 500000,
-            },
-        }
+        # Load settings from the central Config object
+        # These keys should be defined in DEFAULT_CONFIG in utils/config.py
+        self.cache_dir = self.config.get_path("CACHE_DIR", "./data/cache")
+        self.data_dir = self.config.get_path("DATA_DIR", "./data")
+        self.monitoring_dir = self.config.get_path("MONITORING_DIR", "./monitoring")
+        # Use specific cache TTLs if defined, otherwise a general default
+        self.polygon_cache_ttl = self.config.get_int("POLYGON_CACHE_TTL", 3600)
+        self.uw_cache_ttl = self.config.get_int("UNUSUAL_WHALES_CACHE_TTL", 300)
+        self.default_cache_ttl = self.config.get_int("DEFAULT_CACHE_TTL", 86400) # Fallback TTL
 
-        # Update with provided config
-        self.config = self.default_config.copy()
-        if config:
-            self._update_config_recursive(self.config, config)
+        # Load Redis keys from config (consistent with ml_engine)
+        self.redis_notify_key = self.config.get("REDIS_KEY_NOTIFICATIONS", "frontend:notifications")
+        self.redis_notify_limit = self.config.get_int("REDIS_LIMIT_NOTIFICATIONS", 100)
+        self.redis_category_limit = self.config.get_int("REDIS_LIMIT_CATEGORY", 50)
+        self.redis_status_key = self.config.get("REDIS_KEY_SYSTEM_STATUS", "frontend:system:status")
+
+        # TODO: Consider loading rate_limit and retry_settings from config if needed by clients initialized here
+        # self.rate_limit_config = self.config.get_dict("API_RATE_LIMITS", {"polygon": 5, "unusual_whales": 2})
+        # self.retry_config = self.config.get_dict("API_RETRY_SETTINGS", {...})
 
         # Ensure directories exist
-        self._ensure_directories()
+        self._ensure_directories() # Ensure directories based on loaded config paths
 
         # GPU initialization is handled globally by gpu_manager instance creation
         # No need to call self._initialize_gpu() here
@@ -125,58 +109,51 @@ class DataPipeline:
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
 
-        logger.info("Data Pipeline initialized")
+        self.logger.info("Data Pipeline initialized")
 
         # Send notification to frontend using info from gpu_manager
-        if self.redis:
-            gpu_details = get_device_info()
-            self._send_frontend_notification(
-                message="Data Pipeline initialized successfully",
-                level="info",
-                category="system_startup",
-                details={
-                    "gpu_acceleration": "enabled" if gpu_details["use_gpu"] else "disabled",
-                    "gpu_device": gpu_details["device_name"],
-                    "gh200_optimizations": "enabled" if gpu_details["use_gh200"] else "disabled",
-                    "test_mode": self.test_mode,
-                    "cache_dir": self.config["cache_dir"],
-                    "timestamp": time.time()
-                }
-            )
+        # Send notification using configured keys
+        gpu_details = get_device_info()
+        self._send_frontend_notification(
+            message="Data Pipeline initialized successfully",
+            level="info",
+            category="system_startup", # Use a specific category? "data_pipeline_startup"?
+            details={
+                "gpu_acceleration": "enabled" if gpu_details["use_gpu"] else "disabled",
+                "gpu_device": gpu_details["device_name"],
+                "gh200_optimizations": "enabled" if gpu_details["use_gh200"] else "disabled",
+                "test_mode": self.test_mode,
+                "cache_dir": str(self.cache_dir), # Use loaded Path object
+                "timestamp": time.time()
+            }
+        )
 
-    def _update_config_recursive(
-        self, target: dict[str, Any], source: dict[str, Any],
-    ) -> None:
-        """Recursively update a nested dictionary."""
-        for key, value in source.items():
-            if key in target:
-                if isinstance(value, dict) and isinstance(target[key], dict):
-                    self._update_config_recursive(target[key], value)
-                else:
-                    target[key] = value
-            else:
-                target[key] = value
+    # Removed _update_config_recursive - config is handled by the central Config object
 
     def _ensure_directories(self) -> None:
-        """Ensure all required directories exist."""
-        for directory in [
-            self.config["data_dir"],
-            self.config["monitoring_dir"],
-            self.config["cache_dir"],
-        ]:
+        """Ensure all required directories exist using loaded Path objects."""
+        # Use the Path objects loaded from config
+        for directory_path in [self.data_dir, self.monitoring_dir, self.cache_dir]:
             try:
-                os.makedirs(directory, exist_ok=True)
-                logger.info(f"Ensured directory exists: {directory}")
-            except Exception as e:
-                logger.exception(f"Error creating directory {directory}: {e!s}")
+                directory_path.mkdir(parents=True, exist_ok=True)
+                self.logger.info(f"Ensured directory exists: {directory_path}")
+            except OSError as e:
+                # Raise a specific configuration error if directory creation fails
+                msg = f"Failed to create required directory {directory_path}: {e}"
+                self.logger.error(msg)
+                raise ConfigurationError(msg) from e
+            except Exception as e: # Catch any other unexpected errors
+                self.logger.exception(f"Unexpected error creating directory {directory_path}: {e}")
+                # Optionally re-raise or handle
 
     # Removed _initialize_gpu method - now handled by utils.gpu_utils.gpu_manager
 
     def _send_frontend_notification(self, message, level="info", category="data_pipeline", details=None):
         """Send notification to frontend via Redis."""
-        if not self.redis:
-            logger.debug(f"Redis not available, skipping notification: {message}")
-            return
+        # Assume self.redis is valid if initialization succeeded
+        # if not self.redis:
+        #     self.logger.debug(f"Redis not available, skipping notification: {message}")
+        #     return
 
         try:
             notification = {
@@ -184,34 +161,45 @@ class DataPipeline:
                 "timestamp": time.time(), "details": details or {}
             }
             notification_json = json.dumps(notification)
-            list_key = "frontend:notifications"
-            category_key = f"frontend:{category}"
+            # Use configured keys and limits
+            category_key = f"frontend:{category}" # Keep prefix for now
 
-            with self.redis.pipeline() as pipe:
-                pipe.lpush(list_key, notification_json)
-                pipe.ltrim(list_key, 0, 99)
-                pipe.lpush(category_key, notification_json)
-                pipe.ltrim(category_key, 0, 49)
-                pipe.execute()
+            # Use Redis pipeline for atomic operations
+            # Ensure RedisClient supports pipeline context manager or use client directly
+            # Assuming RedisClient provides access to the underlying client or pipeline method
+            if hasattr(self.redis, 'pipeline'):
+                 with self.redis.pipeline() as pipe:
+                     pipe.lpush(self.redis_notify_key, notification_json)
+                     pipe.ltrim(self.redis_notify_key, 0, self.redis_notify_limit - 1)
+                     pipe.lpush(category_key, notification_json)
+                     pipe.ltrim(category_key, 0, self.redis_category_limit - 1)
+                     pipe.execute()
+            else: # Fallback if pipeline context manager not available on RedisClient wrapper
+                 self.redis.lpush(self.redis_notify_key, notification_json)
+                 self.redis.ltrim(self.redis_notify_key, 0, self.redis_notify_limit - 1)
+                 self.redis.lpush(category_key, notification_json)
+                 self.redis.ltrim(category_key, 0, self.redis_category_limit - 1)
 
             log_func = getattr(logger, level, logger.info)
             log_func(f"Frontend notification: {message}")
 
             if category in ["system_status", "data_system"]:
                 try:
-                    status_key = "frontend:system:status"
-                    system_status = json.loads(self.redis.get(status_key) or "{}")
+                    # Use configured status key
+                    system_status = json.loads(self.redis.get(self.redis_status_key) or "{}")
                     system_status.update({
                         "last_update": time.time(),
                         "last_message": message,
                         "status": level
                     })
-                    self.redis.set(status_key, json.dumps(system_status))
-                except Exception as e:
-                    logger.error(f"Error updating system status: {e}")
+                    self.redis.set(self.redis_status_key, json.dumps(system_status))
+                except (json.JSONDecodeError, RedisError) as e: # Catch specific errors
+                    self.logger.error(f"Redis error updating system status: {e}")
+                except Exception as e: # Fallback
+                     self.logger.error(f"Unexpected error updating system status: {e}", exc_info=True)
 
         except Exception as e:
-            logger.error(f"Error sending frontend notification: {e}")
+            logger.error(f"Error sending frontend notification: {e}", exc_info=True)
 
     # Removed _process_dataframe_with_gpu - use gpu_utils.process_array or similar
     # Removed _process_with_pytorch - use gpu_utils.to_gpu/from_gpu
@@ -221,9 +209,11 @@ class DataPipeline:
 
     async def get_ticker_details(self, ticker: str) -> Optional[dict]:
         """Fetch detailed information for a specific ticker."""
+        # Use appropriate TTL (e.g., default or a specific one for details)
+        ttl = self.default_cache_ttl
         cache_key = f"ticker_details:{ticker}"
-        cached = load_from_cache(cache_key, self.redis, self.config['cache_expiry'])
-        if cached:
+        cached = load_from_cache(cache_key, self.redis, ttl)
+        if cached is not None: # Check explicitly for None, as empty dict is valid
             return cached
 
         if not self.polygon:
@@ -234,22 +224,25 @@ class DataPipeline:
             if hasattr(self.polygon, 'get_ticker_details'):
                 details = await self.polygon.get_ticker_details(ticker)
                 if details:
-                    save_to_cache(cache_key, details, self.redis, self.config['cache_expiry'])
+                    save_to_cache(cache_key, details, self.redis, ttl)
                     return details
             else:
                 logger.warning("Polygon client missing 'get_ticker_details' method")
             return None
         except Exception as e:
-            logger.error(f"Error fetching ticker details for {ticker}: {e}")
+            # Use specific exceptions if possible (e.g., APIError from client)
+            self.logger.error(f"Error fetching ticker details for {ticker}: {e}", exc_info=True)
             return None
 
     async def get_all_tickers(self, market: str = 'stocks', active: bool = True, limit: int = 50000) -> Optional[pd.DataFrame]:
         """Fetch a list of all available tickers."""
+        # Use appropriate TTL (e.g., default or a specific one for tickers list)
+        ttl = self.default_cache_ttl
         cache_key = f"all_tickers:{market}:{active}:{limit}"
-        cached = load_from_cache(cache_key, self.redis, self.config['cache_expiry'])
+        cached = load_from_cache(cache_key, self.redis, ttl)
         if cached is not None:
-            # Ensure cached data is DataFrame
-            return cached if isinstance(cached, pd.DataFrame) else pd.DataFrame(cached)
+            # Ensure cached data is DataFrame (assuming save_to_cache handles serialization)
+            return cached # Assuming load_from_cache returns DataFrame directly
 
         if not self.polygon:
             logger.warning("Polygon client not available for get_all_tickers")
@@ -259,13 +252,13 @@ class DataPipeline:
             if hasattr(self.polygon, 'list_tickers'):
                 tickers_df = await self.polygon.list_tickers(market=market, active=active, limit=limit)
                 if tickers_df is not None and not tickers_df.empty:
-                    save_to_cache(cache_key, tickers_df, self.redis, self.config['cache_expiry'])
+                    save_to_cache(cache_key, tickers_df, self.redis, ttl)
                     return tickers_df
             else:
                  logger.warning("Polygon client missing 'list_tickers' method")
             return None
         except Exception as e:
-            logger.error(f"Error fetching all tickers: {e}")
+            self.logger.error(f"Error fetching all tickers: {e}", exc_info=True)
             return None
 
     async def get_latest_quote(self, ticker: str) -> Optional[dict]:
@@ -285,7 +278,7 @@ class DataPipeline:
                 logger.warning("Polygon client missing 'get_last_quote' method")
                 return None
         except Exception as e:
-            logger.error(f"Error fetching latest quote for {ticker}: {e}")
+            self.logger.error(f"Error fetching latest quote for {ticker}: {e}", exc_info=True)
             return None
 
     async def get_aggregates(
@@ -299,10 +292,12 @@ class DataPipeline:
         apply_clean: bool = True # Option to skip cleaning if done elsewhere
     ) -> Optional[pd.DataFrame]:
         """Fetch historical aggregate bars for a ticker."""
+        # Use Polygon-specific TTL
+        ttl = self.polygon_cache_ttl
         cache_key = f"aggregates:{ticker}:{timespan}:{multiplier}:{start_date}:{end_date}:{limit}:{apply_clean}"
-        cached = load_from_cache(cache_key, self.redis, self.config['cache_expiry'])
+        cached = load_from_cache(cache_key, self.redis, ttl)
         if cached is not None:
-             return cached if isinstance(cached, pd.DataFrame) else pd.DataFrame(cached)
+             return cached # Assuming load_from_cache returns DataFrame
 
         if not self.polygon:
             logger.warning("Polygon client not available for get_aggregates")
@@ -319,7 +314,7 @@ class DataPipeline:
                     if apply_clean:
                         agg_df = clean_market_data(agg_df) # Use imported function
 
-                    save_to_cache(cache_key, agg_df, self.redis, self.config['cache_expiry'])
+                    save_to_cache(cache_key, agg_df, self.redis, ttl)
                     return agg_df
                 else:
                     logger.warning(f"No aggregate data returned for {ticker} with params: {timespan}, {start_date}, {end_date}")
@@ -330,7 +325,7 @@ class DataPipeline:
                 logger.warning("Polygon client missing 'get_aggregates' method")
                 return None
         except Exception as e:
-            logger.error(f"Error fetching aggregates for {ticker}: {e}")
+            self.logger.error(f"Error fetching aggregates for {ticker}: {e}", exc_info=True)
             return None
 
     # --- Methods needed by trading_engine (Synchronous Wrappers) ---
@@ -358,7 +353,7 @@ class DataPipeline:
                 }
             return None
         except Exception as e:
-            logger.error(f"Error in sync get_market_data for {symbol}: {e}")
+            self.logger.error(f"Error in sync get_market_data for {symbol}: {e}", exc_info=True)
             return None
 
     def get_intraday_data(self, symbol: str, minutes: Optional[int] = None) -> Optional[dict]:
@@ -380,7 +375,7 @@ class DataPipeline:
                 }
             return None
         except Exception as e:
-            logger.error(f"Error in sync get_intraday_data for {symbol}: {e}")
+            self.logger.error(f"Error in sync get_intraday_data for {symbol}: {e}", exc_info=True)
             return None
 
     def get_last_price(self, symbol: str) -> Optional[float]:
@@ -405,5 +400,5 @@ class DataPipeline:
                       return (float(bid) + float(ask)) / 2.0
             return None # Return None if no usable price found
         except Exception as e:
-            logger.error(f"Error in sync get_last_price for {symbol}: {e}")
+            self.logger.error(f"Error in sync get_last_price for {symbol}: {e}", exc_info=True)
             return None

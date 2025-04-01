@@ -23,31 +23,13 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Type, TypeVar, Union, cast
 
-# Import exceptions module
-try:
-    from exceptions import (
-        ConfigurationError,
-        EnvironmentVariableError,
-        InvalidConfigurationError,
-        MissingConfigurationError,
-    )
-except ImportError:
-    # Fallback if exceptions module is not available
-    class ConfigurationError(Exception):
-        """Base class for configuration errors"""
-        pass
-    
-    class EnvironmentVariableError(ConfigurationError):
-        """Error related to environment variables"""
-        pass
-    
-    class InvalidConfigurationError(ConfigurationError):
-        """Invalid configuration value or structure"""
-        pass
-    
-    class MissingConfigurationError(ConfigurationError):
-        """Required configuration is missing"""
-        pass
+# Import custom exceptions
+from .exceptions import (
+    ConfigurationError,
+    EnvironmentVariableError,
+    InvalidConfigurationError,
+    MissingConfigurationError,
+)
 
 # Configure logging
 logger = logging.getLogger("config")
@@ -816,6 +798,10 @@ DEFAULT_CONFIG = {
             "description": "Unusual Whales cache TTL in seconds"
         }
     },
+    "DEFAULT_CACHE_TTL": {
+        "value": 86400, # 1 day
+        "__meta__": {"description": "Default cache TTL in seconds if specific TTL is not defined"}
+    },
     
     # Processing Settings
     "USE_GPU": {
@@ -889,7 +875,166 @@ DEFAULT_CONFIG = {
         "__meta__": {
             "description": "Directory for log files"
         }
-    }
+    },
+
+    # --- ML Engine Settings ---
+    "ML_MIN_SAMPLES": {
+        "value": 1000,
+        "__meta__": {"description": "Minimum samples required for training"}
+    },
+    "ML_LOOKBACK_DAYS": {
+        "value": 30,
+        "__meta__": {"description": "Number of days of historical data to load"}
+    },
+    "ML_FEATURE_SELECTION": {
+        "value": {
+            "enabled": True,
+            "method": "importance",  # 'importance', 'rfe', 'mutual_info'
+            "threshold": 0.01,  # For importance-based selection
+            "n_features": 20,  # For RFE
+        },
+        "__meta__": {"description": "Configuration for feature selection"}
+    },
+    "ML_TIME_SERIES_CV": {
+        "value": {
+            "enabled": True,
+            "n_splits": 5,
+            "embargo_size": 10,  # Number of samples to exclude between train and test
+        },
+        "__meta__": {"description": "Configuration for time series cross-validation"}
+    },
+    "ML_MONITORING": {
+        "value": {"enabled": True, "drift_threshold": 0.05},
+        "__meta__": {"description": "Configuration for model monitoring (e.g., drift detection)"}
+    },
+    "ML_TEST_SIZE": {
+        "value": 0.2,
+        "__meta__": {"description": "Fraction of data to use for testing"}
+    },
+    "ML_RANDOM_STATE": {
+        "value": 42,
+        "__meta__": {"description": "Random state for reproducibility"}
+    },
+    "ML_OPTIMIZE_HYPERPARAMS": {
+        "value": False,
+        "__meta__": {"description": "Whether to run hyperparameter optimization during training"}
+    },
+    "ML_MODEL_CONFIGS": {
+        "value": {
+            "signal_detection": {
+                "type": "xgboost",
+                "params": {
+                    "max_depth": 6, "learning_rate": 0.03, "subsample": 0.8,
+                    "n_estimators": 200, "objective": "binary:logistic", "eval_metric": "auc",
+                },
+            },
+            "price_prediction": {
+                "type": "lstm",
+                "params": {
+                    "units": [64, 32], "dropout": 0.3, "epochs": 50,
+                    "batch_size": 32, "learning_rate": 0.001,
+                },
+            },
+            "risk_assessment": {
+                "type": "random_forest",
+                "params": {
+                    "n_estimators": 100, "max_depth": 6, "max_features": "sqrt", "min_samples_leaf": 30,
+                },
+            },
+            "exit_strategy": {
+                "type": "xgboost",
+                "params": {
+                    "max_depth": 5, "learning_rate": 0.02, "subsample": 0.8,
+                    "n_estimators": 150, "objective": "reg:squarederror",
+                },
+            },
+            "market_regime": {
+                "type": "kmeans",
+                "params": {"n_clusters": 4, "random_state": 42},
+            },
+        },
+        "__meta__": {"description": "Dictionary containing configurations for each ML model type"}
+    },
+    "ML_SIGNAL_FEATURES": {
+        "value": [
+            "close", "open", "high", "low", "volume", # Price-based
+            "sma5", "sma10", "sma20", "ema5", "ema10", "ema20", # MAs
+            "macd", "macd_signal", "macd_hist", # MACD
+            "price_rel_sma5", "price_rel_sma10", "price_rel_sma20", # Price vs MA
+            "mom1", "mom5", "mom10", # Momentum
+            "volatility_30d", "volume_ratio", "rsi", "bollinger_upper", "bollinger_lower", "bb_width", # Volatility/Oscillators
+            "spy_close", "vix_close", "spy_change", "vix_change", # Market context
+            "put_call_ratio", "implied_volatility", "option_volume" # Options context (if available)
+        ],
+        "__meta__": {"description": "List of feature columns for signal detection models"}
+    },
+    "ML_PRICE_FEATURES": {
+        "value": [
+            "close", "high", "low", "volume", # Price-based
+            "price_rel_sma5", "price_rel_sma10", "price_rel_sma20", # Price vs MA
+            "macd", "rsi", "volatility_30d", # Indicators
+            "spy_close", "vix_close" # Market context
+        ],
+        "__meta__": {"description": "List of feature columns for price prediction models (e.g., LSTM)"}
+    },
+    "ML_PRICE_TARGETS": {
+        "value": ["future_return_5min", "future_return_10min", "future_return_30min"],
+        "__meta__": {"description": "List of target columns for price prediction models"}
+    },
+
+    # --- XGBoost Specific Settings ---
+    "XGBOOST_USE_GPU": {
+        "value": True,
+        "__meta__": {"description": "Enable GPU usage for XGBoost (if available)"}
+    },
+    "XGBOOST_USE_PYTORCH": {
+        "value": True, # Assuming XGBoostModel uses PyTorch integration by default if available
+        "__meta__": {"description": "Enable PyTorch integration for XGBoostModel (if applicable)"}
+    },
+    "XGBOOST_TREE_METHOD": {
+        "value": "auto", # Let XGBoost decide based on GPU availability ('gpu_hist' or 'hist')
+        "__meta__": {"description": "Tree method for XGBoost ('auto', 'gpu_hist', 'hist')"}
+    },
+    "XGBOOST_GPU_ID": {
+        "value": 0,
+        "__meta__": {"description": "GPU device ID for XGBoost"}
+    },
+
+    # --- Redis Keys/Limits ---
+    "REDIS_KEY_NOTIFICATIONS": {
+        "value": "frontend:notifications",
+        "__meta__": {"description": "Redis key for general frontend notifications list"}
+    },
+    "REDIS_LIMIT_NOTIFICATIONS": {
+        "value": 100,
+        "__meta__": {"description": "Max number of items to keep in the general notifications list"}
+    },
+    "REDIS_LIMIT_CATEGORY": {
+        "value": 50,
+        "__meta__": {"description": "Max number of items to keep in category-specific notification lists"}
+    },
+    "REDIS_KEY_SYSTEM_STATUS": {
+        "value": "frontend:system:status",
+        "__meta__": {"description": "Redis key for storing system status"}
+    },
+    "REDIS_KEY_MODEL_INFO": {
+        "value": "models:info",
+        "__meta__": {"description": "Redis key for storing ML model metadata"}
+    },
+    "REDIS_PREFIX_PREDICTIONS": {
+        "value": "predictions:",
+        "__meta__": {"description": "Redis key prefix for storing latest predictions per ticker"}
+    },
+
+    # --- Monitoring Directory ---
+    "MONITORING_DIR": {
+        "value": "./monitoring", # Default value if not provided by env/file
+        "__meta__": {"description": "Directory for monitoring artifacts (e.g., drift reports)"}
+    }, # <-- Added missing comma here
+    "REDIS_KEY_DRIFT": {
+        "value": "frontend:drift_detection",
+        "__meta__": {"description": "Redis key for drift detection notifications list"}
+    }, # Added comma after the REDIS_KEY_DRIFT block
 }
 
 # Load default configuration

@@ -16,16 +16,19 @@ leverages the utility functions for feature selection, drift detection, etc.
 import json
 import logging
 import os
+from datetime import datetime # Import datetime
 import time
-from dotenv import load_dotenv
-from typing import Any, Dict, List, Optional, Union
+# from dotenv import load_dotenv # Config handles this
+from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
 
 from utils.logging_config import get_logger
+from utils.config import Config, get_config # Import Config system
+from utils.exceptions import ConfigurationError, ModelError, DataError, RedisError # Import custom exceptions
 from utils.gpu_utils import is_gpu_available, gpu_manager, clear_gpu_memory
-from utils.metrics_registry import MODEL_TRAINING_TIME, PREDICTION_LATENCY
+from utils.metrics_registry import MODEL_TRAINING_TIME, PREDICTION_LATENCY, register_metrics_server_if_needed
 
 from ml_engine.data_processor import MLDataProcessor
 from ml_engine.trainers.signal_detection import SignalDetectionTrainer
@@ -35,13 +38,9 @@ from ml_engine.trainers.exit_strategy import ExitStrategyTrainer
 from ml_engine.trainers.market_regime import MarketRegimeTrainer
 from ml_engine.utils import optimize_hyperparameters
 
-# Load environment variables
-load_dotenv()
+# load_dotenv() # Handled by Config
 
-# Get XGBoost configuration from environment variables
-XGBOOST_USE_GPU = os.environ.get("XGBOOST_USE_GPU", "true").lower() == "true"
-XGBOOST_USE_PYTORCH = os.environ.get("XGBOOST_USE_PYTORCH", "true").lower() == "true"
-XGBOOST_TREE_METHOD = os.environ.get("XGBOOST_TREE_METHOD", "gpu_hist")
+# XGBoost settings will be loaded from Config object later
 
 # Configure logging
 logger = get_logger("ml_engine.base")
@@ -68,8 +67,14 @@ try:
     XGBOOST_MODEL_AVAILABLE = True
 except ImportError:
     XGBOOST_MODEL_AVAILABLE = False
-    logger.warning("XGBoostModel not available. Using direct XGBoost integration.")
+    logger.warning("XGBoostModel class not available. Using direct XGBoost integration.")
+    XGBoostModel = None # Define as None if not available
 
+
+# Forward declaration for type hints if DataPipeline is used directly
+if TYPE_CHECKING:
+    from data_pipeline.main import DataPipeline
+    from utils.redis_helpers import RedisClient
 
 class MLModelTrainer:
     """
@@ -77,102 +82,81 @@ class MLModelTrainer:
     Builds and trains models using live market data
     """
 
-    def __init__(self, redis_client, data_loader) -> None:
+    def __init__(self, config: Config, redis_client: 'RedisClient', data_loader: 'DataPipeline') -> None:
         """
         Initialize ML Model Trainer
-        
-        Args:
-            redis_client: Redis client for caching and notifications
-            data_loader: Data loader instance
-        """
-        self.redis = redis_client
-        self.data_loader = data_loader
 
+        Args:
+            config: Centralized configuration object
+            redis_client: Shared Redis client instance
+            data_loader: Shared Data loader instance
+        """
+        self.config = config
+        self.redis = redis_client # Use injected shared client
+        self.data_loader = data_loader # Use injected shared loader
+        self.logger = get_logger(__name__) # Use configured logger
         # Initialize GPU acceleration
-        self.use_gpu = os.environ.get("USE_GPU", "true").lower() == "true"
+        # Initialize GPU acceleration based on config
+        self.use_gpu = self.config.get_bool("USE_GPU", True)
+        self.gpu_available = False
+        self.device_name = "CPU"
+        self.device_memory = 0
         if self.use_gpu:
-            # Use the GPU manager from utils.gpu_utils
             self.gpu_available = is_gpu_available()
             if self.gpu_available:
-                logger.info(f"GPU acceleration enabled: {gpu_manager.device_name}")
                 self.device_name = gpu_manager.device_name
                 self.device_memory = gpu_manager.total_memory
+                self.logger.info(f"GPU acceleration enabled: {self.device_name}")
             else:
-                logger.warning("GPU acceleration requested but no GPU is available")
-                self.use_gpu = False
+                self.logger.warning("Config 'USE_GPU' is true, but no compatible GPU detected. Falling back to CPU.")
+                self.use_gpu = False # Force disable if not available
+        else:
+             self.logger.info("GPU acceleration disabled by configuration ('USE_GPU': false).")
 
-        # Configuration
-        self.config = {
-            "models_dir": os.environ.get("MODELS_DIR", "./models"),
-            "monitoring_dir": os.environ.get("MONITORING_DIR", "./monitoring"),
-            "data_dir": os.environ.get("DATA_DIR", "./data"),
-            "min_samples": 1000,
-            "lookback_days": 30,
-            "feature_selection": {
-                "enabled": True,
-                "method": "importance",  # 'importance', 'rfe', 'mutual_info'
-                "threshold": 0.01,  # For importance-based selection
-                "n_features": 20,  # For RFE
-            },
-            "time_series_cv": {
-                "enabled": True,
-                "n_splits": 5,
-                "embargo_size": 10,  # Number of samples to exclude between train and test
-            },
-            "monitoring": {"enabled": True, "drift_threshold": 0.05},
-            "test_size": 0.2,
-            "random_state": 42,
-            "model_configs": {
-                "signal_detection": {
-                    "type": "xgboost",
-                    "params": {
-                        "max_depth": 6,
-                        "learning_rate": 0.03,
-                        "subsample": 0.8,
-                        "n_estimators": 200,
-                        "objective": "binary:logistic",
-                        "eval_metric": "auc",
-                    },
-                },
-                "price_prediction": {
-                    "type": "lstm",
-                    "params": {
-                        "units": [64, 32],
-                        "dropout": 0.3,
-                        "epochs": 50,
-                        "batch_size": 32,
-                        "learning_rate": 0.001,
-                    },
-                },
-                "risk_assessment": {
-                    "type": "random_forest",
-                    "params": {
-                        "n_estimators": 100,
-                        "max_depth": 6,
-                        "max_features": "sqrt",
-                        "min_samples_leaf": 30,
-                    },
-                },
-                "exit_strategy": {
-                    "type": "xgboost",
-                    "params": {
-                        "max_depth": 5,
-                        "learning_rate": 0.02,
-                        "subsample": 0.8,
-                        "n_estimators": 150,
-                        "objective": "reg:squarederror",
-                    },
-                },
-                "market_regime": {
-                    "type": "kmeans",
-                    "params": {"n_clusters": 4, "random_state": 42},
-                },
-            },
-        }
+        # Load ML-specific configurations from the central Config object
+        # These keys should be defined in DEFAULT_CONFIG in utils/config.py
+        self.models_dir = self.config.get_path("MODEL_DIR", "./models")
+        self.monitoring_dir = self.config.get_path("MONITORING_DIR", "./monitoring")
+        self.data_dir = self.config.get_path("DATA_DIR", "./data")
+        self.min_samples = self.config.get_int("ML_MIN_SAMPLES", 1000)
+        self.lookback_days = self.config.get_int("ML_LOOKBACK_DAYS", 30)
+        self.feature_selection_config = self.config.get_dict("ML_FEATURE_SELECTION", {
+            "enabled": True, "method": "importance", "threshold": 0.01, "n_features": 20
+        })
+        self.time_series_cv_config = self.config.get_dict("ML_TIME_SERIES_CV", {
+            "enabled": True, "n_splits": 5, "embargo_size": 10
+        })
+        self.monitoring_config = self.config.get_dict("ML_MONITORING", {
+            "enabled": True, "drift_threshold": 0.05
+        })
+        self.test_size = self.config.get_float("ML_TEST_SIZE", 0.2)
+        self.random_state = self.config.get_int("ML_RANDOM_STATE", 42)
+        self.model_configs = self.config.get_dict("ML_MODEL_CONFIGS", {}) # Load model specifics
+
+        # Load XGBoost specific settings from config
+        self.xgboost_use_gpu = self.config.get_bool("XGBOOST_USE_GPU", True) and self.gpu_available
+        self.xgboost_use_pytorch = self.config.get_bool("XGBOOST_USE_PYTORCH", True)
+        self.xgboost_tree_method = self.config.get("XGBOOST_TREE_METHOD", "gpu_hist" if self.xgboost_use_gpu else "hist")
+        self.xgboost_gpu_id = self.config.get_int("XGBOOST_GPU_ID", 0)
+
+        # Load Redis keys from config
+        self.redis_notify_key = self.config.get("REDIS_KEY_NOTIFICATIONS", "frontend:notifications")
+        self.redis_notify_limit = self.config.get_int("REDIS_LIMIT_NOTIFICATIONS", 100)
+        self.redis_category_limit = self.config.get_int("REDIS_LIMIT_CATEGORY", 50)
+        self.redis_status_key = self.config.get("REDIS_KEY_SYSTEM_STATUS", "frontend:system:status")
+        self.redis_model_info_key = self.config.get("REDIS_KEY_MODEL_INFO", "models:info")
+        self.redis_predictions_prefix = self.config.get("REDIS_PREFIX_PREDICTIONS", "predictions:")
+
+        # Ensure model directory exists
+        try:
+            self.models_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+             raise ConfigurationError(f"Failed to create models directory {self.models_dir}: {e}") from e
 
         # Initialize data processor
+        # Initialize data processor (assuming it accepts Config)
         self.data_processor = MLDataProcessor(
-            data_loader=self.data_loader, redis_client=self.redis, config=self.config,
+            config=self.config, data_loader=self.data_loader, redis_client=self.redis
         )
 
         # Initialize tracking variables
@@ -182,7 +166,10 @@ class MLModelTrainer:
         # Initialize model trainers
         self._init_model_trainers()
 
-        logger.info("ML Model Trainer initialized")
+        # Start Prometheus metrics server if enabled in config
+        register_metrics_server_if_needed(self.config)
+
+        self.logger.info("ML Model Trainer initialized")
 
     def _send_frontend_notification(self, message, level="info", category="ml_engine", details=None):
         """
@@ -194,10 +181,10 @@ class MLModelTrainer:
             category (str): Notification category for filtering
             details (dict): Additional details for the notification
         """
-        if not self.redis:
-            logger.debug(
-                f"Redis not available, skipping notification: {message}")
-            return
+        # No need to check self.redis, assume it's initialized if we got here
+        # if not self.redis:
+        #     self.logger.debug(f"Redis not available, skipping notification: {message}")
+        #     return
 
         try:
             # Create notification object
@@ -209,15 +196,14 @@ class MLModelTrainer:
                 "details": details or {}
             }
 
-            # Add to general notifications list
-            self.redis.lpush("frontend:notifications",
-                              json.dumps(notification))
-            self.redis.ltrim("frontend:notifications", 0, 99)  # Keep last 100
+            # Add to general notifications list using configured key and limit
+            self.redis.lpush(self.redis_notify_key, json.dumps(notification))
+            self.redis.ltrim(self.redis_notify_key, 0, self.redis_notify_limit - 1)
 
-            # Add to category-specific list
-            category_key = f"frontend:{category}"
+            # Add to category-specific list using configured limit
+            category_key = f"frontend:{category}" # Keep prefix for now, maybe configure later
             self.redis.lpush(category_key, json.dumps(notification))
-            self.redis.ltrim(category_key, 0, 49)  # Keep last 50 per category
+            self.redis.ltrim(category_key, 0, self.redis_category_limit - 1)
 
             # Log based on level
             if level == "error":
@@ -230,45 +216,49 @@ class MLModelTrainer:
             # Update system status if this is a system-level notification
             if category in ["system_status", "ml_system"]:
                 try:
-                    system_status = json.loads(self.redis.get(
-                        "frontend:system:status") or "{}")
+                    system_status = json.loads(self.redis.get(self.redis_status_key) or "{}")
                     system_status["last_update"] = time.time()
                     system_status["last_message"] = message
                     system_status["status"] = level
-                    self.redis.set("frontend:system:status",
-                                   json.dumps(system_status))
-                except Exception as e:
-                    logger.error(f"Error updating system status: {e}")
+                    self.redis.set(self.redis_status_key, json.dumps(system_status))
+                except (json.JSONDecodeError, RedisError) as e: # Catch specific errors
+                    self.logger.error(f"Error updating system status in Redis: {e}")
+                except Exception as e: # Fallback
+                     self.logger.error(f"Unexpected error updating system status: {e}", exc_info=True)
 
         except Exception as e:
-            logger.error(f"Error sending frontend notification: {e}")
+            logger.error(f"Error sending frontend notification: {e}", exc_info=True)
 
     def _init_model_trainers(self) -> None:
         """Initialize model trainers"""
         try:
             self.trainers = {
                 "signal_detection": SignalDetectionTrainer(
-                    config=self.config,
+                    config=self.config, # Pass central config
                     redis_client=self.redis,
                 ),
                 "price_prediction": PricePredictionTrainer(
-                    config=self.config,
+                    config=self.config, # Pass central config
                     redis_client=self.redis,
-                    use_gpu=self.use_gpu if hasattr(self, "use_gpu") else False,
+                    use_gpu=self.use_gpu, # Pass determined GPU status
                 ),
                 "risk_assessment": RiskAssessmentTrainer(
-                    config=self.config,
+                    config=self.config, # Pass central config
                     redis_client=self.redis,
                 ),
                 "exit_strategy": ExitStrategyTrainer(
-                    config=self.config,
+                    config=self.config, # Pass central config
                     redis_client=self.redis,
                 ),
                 "market_regime": MarketRegimeTrainer(
-                    config=self.config,
+                    config=self.config, # Pass central config
                     redis_client=self.redis,
                 ),
             }
+            # Filter out trainers whose model configs might be missing
+            self.trainers = {name: trainer for name, trainer in self.trainers.items() if name in self.model_configs}
+            if not self.trainers:
+                 self.logger.warning("No valid model configurations found in ML_MODEL_CONFIGS. No trainers initialized.")
         except ImportError as e:
             logger.warning(f"Could not initialize all model trainers: {e!s}")
             # Continue with available trainers
@@ -284,7 +274,7 @@ class MLModelTrainer:
             category="ml_training",
             details={
                 "models": list(self.trainers.keys()),
-                "gpu_enabled": self.use_gpu if hasattr(self, "use_gpu") else False,
+                "gpu_enabled": self.use_gpu,
                 "start_time": time.time()
             }
         )
@@ -293,24 +283,30 @@ class MLModelTrainer:
         self.training_start_time = time.time()
 
         # Run hyperparameter optimization if enabled
-        if os.environ.get("OPTIMIZE_HYPERPARAMS", "false").lower() == "true":
-            logger.info("Running hyperparameter optimization")
-            if PROMETHEUS_AVAILABLE:
-                # Load historical data
-                historical_data = self.data_processor.load_historical_data()
+        # Check config for optimization flag
+        if self.config.get_bool("ML_OPTIMIZE_HYPERPARAMS", False):
+            self.logger.info("Running hyperparameter optimization (as configured)")
+            # Assuming optimize_hyperparameters uses config internally or needs it passed
+            try:
+                 # Load historical data (might be redundant if _train_all_models also loads)
+                 historical_data = self.data_processor.load_historical_data()
+                 if historical_data is not None and not historical_data.empty:
+                      # Example: Optimize signal detection model
+                      # This function needs access to the central config now
+                      optimize_hyperparameters(
+                          historical_data,
+                          "signal_detection",
+                          self.config, # Pass central config
+                          self.data_processor,
+                      )
+                      # TODO: Add optimization calls for other relevant models
+                 else:
+                      self.logger.error("Cannot run hyperparameter optimization: Failed to load historical data.")
 
-                if historical_data is not None and not historical_data.empty:
-                    # Optimize signal detection model
-                    optimize_hyperparameters(
-                        historical_data,
-                        "signal_detection",
-                        self.config,
-                        self.data_processor,
-                    )
-            else:
-                logger.warning(
-                    "Optuna not available. Skipping hyperparameter optimization.",
-                )
+            except ImportError:
+                 self.logger.warning("Hyperparameter optimization library (e.g., Optuna) not available. Skipping optimization.")
+            except Exception as e:
+                 self.logger.error(f"Error during hyperparameter optimization: {e}", exc_info=True)
 
         # Continue with regular training
         self._train_all_models()
@@ -327,6 +323,7 @@ class MLModelTrainer:
                            pd.DataFrame) and historical_data.empty
             ):
                 logger.error("Failed to load sufficient historical data")
+                self._send_frontend_notification("Failed to load historical data for training.", level="error", category="ml_training")
                 return False
 
             # Store reference data for drift detection
@@ -498,7 +495,8 @@ class MLModelTrainer:
                     "total_time": total_training_time,
                     "model_results": model_results,
                     "gpu_used": self.use_gpu if hasattr(self, "use_gpu") else False,
-                    "training_times": self.model_training_times
+                    "training_times": self.model_training_times,
+                    "model_configs_used": {k: self.model_configs.get(k, {}).get('params', {}) for k in model_results}
                 }
             )
 
@@ -507,8 +505,17 @@ class MLModelTrainer:
             )
             return True
 
+        except DataError as e:
+             self.logger.error(f"Data error during model training: {e}", exc_info=True)
+             self._send_frontend_notification(f"Data error during training: {e}", level="error", category="ml_training")
+             return False
+        except ModelError as e:
+             self.logger.error(f"Model training error: {e}", exc_info=True)
+             self._send_frontend_notification(f"Model training error: {e}", level="error", category="ml_training")
+             return False
         except Exception as e:
-            logger.error(f"Error training models: {e!s}", exc_info=True)
+            self.logger.error(f"Unexpected error training models: {e}", exc_info=True)
+            self._send_frontend_notification(f"Unexpected error during training: {e}", level="error", category="ml_training")
             return False
 
     def update_model_info(self) -> None:
@@ -517,43 +524,57 @@ class MLModelTrainer:
             # Collect model info
             models_info = {}
 
-            for model_name, config in self.config["model_configs"].items():
-                # Check for both .xgb and .json formats for XGBoost models
-                if config['type'] == 'xgboost':
-                    model_paths = [
-                        os.path.join(self.config["models_dir"], f"{model_name}_model.xgb"),
-                        os.path.join(self.config["models_dir"], f"{model_name}_model.json")
-                    ]
-                    # Use the first path that exists
-                    model_path = next((path for path in model_paths if os.path.exists(path)), None)
+            for model_name, model_config in self.model_configs.items():
+                model_type = model_config.get('type', 'unknown')
+                # Determine expected file extension based on type (could be more robust)
+                if model_type == 'xgboost':
+                     # Prefer .json if available, fallback to .xgb
+                     model_paths = [
+                          self.models_dir / f"{model_name}_model.json",
+                          self.models_dir / f"{model_name}_model.xgb"
+                     ]
+                     model_path = next((path for path in model_paths if path.exists()), None)
+                elif model_type in ['random_forest', 'kmeans', 'scaler']: # Added scaler
+                     model_path = self.models_dir / f"{model_name}_model.pkl"
+                elif model_type == 'lstm': # Assuming Keras/TF format
+                     model_path = self.models_dir / f"{model_name}_model.keras" # Or SavedModel directory
                 else:
-                    model_path = os.path.join(
-                        self.config["models_dir"],
-                        f"{model_name}_model.{'pkl' if config['type'] in ['random_forest', 'kmeans'] else 'keras'}",
-                    )
+                     model_path = None # Unknown type
 
-                if model_path and os.path.exists(model_path):
-                    file_stats = os.stat(model_path)
+                # Check scaler path separately if needed (e.g., for signal detection)
+                scaler_path = self.models_dir / f"{model_name}_scaler.pkl"
 
-                    models_info[model_name] = {
-                        "type": config["type"],
-                        "path": model_path,
+                model_info_entry = {"type": model_type}
+                if model_path and model_path.exists():
+                    file_stats = model_path.stat()
+                    model_info_entry.update({
+                        "path": str(model_path), # Store as string for JSON
                         "size_bytes": file_stats.st_size,
                         "last_modified": int(file_stats.st_mtime),
-                        "last_modified_str": time.strftime(
-                            "%Y-%m-%d %H:%M:%S", 
-                            time.localtime(file_stats.st_mtime)
-                        ),
-                    }
+                        "last_modified_str": datetime.fromtimestamp(file_stats.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                    })
+                else:
+                     model_info_entry["status"] = "Missing"
+
+                # Add scaler info if it exists
+                if scaler_path.exists():
+                     scaler_stats = scaler_path.stat()
+                     model_info_entry["scaler"] = {
+                          "path": str(scaler_path),
+                          "size_bytes": scaler_stats.st_size,
+                          "last_modified": int(scaler_stats.st_mtime),
+                     }
+
+                models_info[model_name] = model_info_entry
 
             # Update Redis
             if self.redis:
-                self.redis.set("models:info", json.dumps(models_info))
+                self.redis.set(self.redis_model_info_key, json.dumps(models_info))
 
             logger.info(f"Updated model info for {len(models_info)} models")
 
         except Exception as e:
-            logger.error(f"Error updating model info: {e!s}", exc_info=True)
+            logger.error(f"Error updating model info: {e}", exc_info=True)
 
     def predict_signals(self, market_data):
         """
@@ -583,18 +604,19 @@ class MLModelTrainer:
                 logger.info("Using XGBoostModel for signal prediction")
                 
                 # Check for model files - try both .json and .xgb formats
+                # Use configured models_dir (Path object)
                 model_paths = [
-                    os.path.join(self.config["models_dir"], "signal_detection_model.json"),
-                    os.path.join(self.config["models_dir"], "signal_detection_model.xgb")
+                    self.models_dir / "signal_detection_model.json",
+                    self.models_dir / "signal_detection_model.xgb"
                 ]
-                signal_model_path = next((path for path in model_paths if os.path.exists(path)), None)
-                signal_scaler_path = os.path.join(
-                    self.config["models_dir"], "signal_detection_scaler.pkl",
-                )
+                signal_model_path = next((path for path in model_paths if path.exists()), None)
+                signal_scaler_path = self.models_dir / "signal_detection_scaler.pkl"
 
-                if not signal_model_path or not os.path.exists(signal_scaler_path):
-                    logger.error("Signal detection model or scaler not found")
-                    return {}
+                if not signal_model_path or not signal_scaler_path.exists():
+                    msg = "Signal detection model or scaler file not found."
+                    logger.error(msg)
+                    self._send_frontend_notification(msg, level="error", category="ml_prediction")
+                    raise ModelError(msg) # Raise specific error
 
                 # Load scaler
                 import joblib
@@ -608,12 +630,12 @@ class MLModelTrainer:
                 
                 # Create XGBoostModel instance
                 model = XGBoostModel(
-                    model_path=signal_model_path,
+                    model_path=str(signal_model_path), # Pass path as string
                     model_type="classifier",
-                    use_gpu=self.use_gpu if hasattr(self, "use_gpu") else False,
-                    use_pytorch=XGBOOST_USE_PYTORCH,
-                    tree_method=XGBOOST_TREE_METHOD if self.use_gpu else 'hist',
-                    gpu_id=int(os.environ.get("XGBOOST_GPU_ID", "0"))
+                    use_gpu=self.xgboost_use_gpu, # Use loaded config
+                    use_pytorch=self.xgboost_use_pytorch, # Use loaded config
+                    tree_method=self.xgboost_tree_method, # Use loaded config
+                    gpu_id=self.xgboost_gpu_id # Use loaded config
                 )
                 
                 # Make predictions
@@ -624,18 +646,15 @@ class MLModelTrainer:
                 logger.info("Using direct XGBoost for signal prediction")
                 
                 # Check for model files
-                signal_model_path = os.path.join(
-                    self.config["models_dir"], "signal_detection_model.xgb",
-                )
-                signal_scaler_path = os.path.join(
-                    self.config["models_dir"], "signal_detection_scaler.pkl",
-                )
+                # Use configured models_dir (Path object)
+                signal_model_path = self.models_dir / "signal_detection_model.xgb"
+                signal_scaler_path = self.models_dir / "signal_detection_scaler.pkl"
 
-                if not os.path.exists(signal_model_path) or not os.path.exists(
-                    signal_scaler_path,
-                ):
-                    logger.error("Signal detection model or scaler not found")
-                    return {}
+                if not signal_model_path.exists() or not signal_scaler_path.exists():
+                    msg = "Signal detection model (.xgb) or scaler file not found."
+                    logger.error(msg)
+                    self._send_frontend_notification(msg, level="error", category="ml_prediction")
+                    raise ModelError(msg) # Raise specific error
 
                 # Load model and scaler
                 import joblib
@@ -679,8 +698,8 @@ class MLModelTrainer:
             # Update predictions in Redis if available
             if self.redis:
                 for ticker, pred in predictions.items():
-                    self.redis.hset(
-                        f"predictions:{ticker}", "signal", json.dumps(pred))
+                    # Use configured prefix
+                    self.redis.hset(f"{self.redis_predictions_prefix}{ticker}", "signal", json.dumps(pred))
 
                 # Send notification to frontend about new predictions
                 try:
@@ -703,34 +722,41 @@ class MLModelTrainer:
                     }
 
                     # Push to notifications list
-                    self.redis.lpush("frontend:notifications",
-                                     json.dumps(notification))
-                    self.redis.ltrim("frontend:notifications", 0, 99)
+                    # Use configured keys and limits
+                    self.redis.lpush(self.redis_notify_key, json.dumps(notification))
+                    self.redis.ltrim(self.redis_notify_key, 0, self.redis_notify_limit - 1)
 
                     # Also store in ml_predictions category
-                    self.redis.lpush("frontend:ml_predictions",
-                                     json.dumps(notification))
-                    self.redis.ltrim("frontend:ml_predictions", 0, 49)
+                    category_key = "frontend:ml_predictions" # Keep prefix for now
+                    self.redis.lpush(category_key, json.dumps(notification))
+                    self.redis.ltrim(category_key, 0, self.redis_category_limit - 1)
 
                     # Update system status
-                    system_status = json.loads(self.redis.get(
-                        "frontend:system:status") or "{}")
+                    # Use configured status key
+                    system_status = json.loads(self.redis.get(self.redis_status_key) or "{}")
                     system_status["last_prediction"] = time.time()
-                    system_status["prediction_count"] = system_status.get(
-                        "prediction_count", 0) + 1
+                    system_status["prediction_count"] = system_status.get("prediction_count", 0) + 1
                     system_status["last_positive_signals"] = positive_signals
-                    self.redis.set("frontend:system:status",
-                                   json.dumps(system_status))
+                    self.redis.set(self.redis_status_key, json.dumps(system_status))
 
                     logger.info(
                         f"Prediction notification sent to frontend: {positive_signals} buy signals")
                 except Exception as e:
-                    logger.error(f"Error sending prediction notification: {e}")
+                    logger.error(f"Error sending prediction notification: {e}", exc_info=True)
 
             return predictions
 
-        except Exception as e:
-            logger.error(f"Error making predictions: {e!s}", exc_info=True)
+        except ModelError as e: # Catch model loading/prediction errors
+             logger.error(f"Model error during prediction: {e}", exc_info=True)
+             self._send_frontend_notification(f"Model error during prediction: {e}", level="error", category="ml_prediction")
+             return {}
+        except DataError as e: # Catch data preparation errors
+             logger.error(f"Data error during prediction: {e}", exc_info=True)
+             self._send_frontend_notification(f"Data error during prediction: {e}", level="error", category="ml_prediction")
+             return {}
+        except Exception as e: # General fallback
+            logger.error(f"Unexpected error making predictions: {e}", exc_info=True)
+            self._send_frontend_notification(f"Unexpected prediction error: {e}", level="error", category="ml_prediction")
             # Record error in Prometheus if available
             if PROMETHEUS_AVAILABLE:
                 from utils.metrics_registry import DRIFT_DETECTION

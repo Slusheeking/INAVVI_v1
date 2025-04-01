@@ -4,6 +4,7 @@ import json
 import logging
 import time
 import numpy as np
+import mlflow # Added MLflow import
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 from .drift_detector import DriftDetector
@@ -79,6 +80,19 @@ class ModelPerformanceTracker:
             "timestamp": timestamp,
             "metrics": metrics
         })
+
+        # --- MLflow Integration Start ---
+        try:
+            # Log metrics to MLflow. Assumes an active run exists.
+            # Convert metric values to float where possible for MLflow compatibility
+            mlflow_metrics = {k: float(v) for k, v in metrics.items() if isinstance(v, (int, float, np.number))}
+            if mlflow_metrics:
+                mlflow.log_metrics(mlflow_metrics)
+            # Log timestamp separately if needed, though MLflow logs metrics with its own timestamp
+            # mlflow.log_metric("tracking_timestamp", timestamp)
+        except Exception as mlflow_e:
+            logging.warning(f"Failed to log metrics to MLflow: {mlflow_e}")
+        # --- MLflow Integration End ---
 
         # Check for performance alerts
         self._check_for_alerts(model_name, version, metrics)
@@ -200,6 +214,15 @@ class ModelPerformanceTracker:
         for feature_name, values in features.items():
             try:
                 psi = self.drift_detector.calculate_psi(feature_name, values)
+
+                # --- MLflow Integration Start ---
+                try:
+                    # Log PSI as a metric
+                    mlflow.log_metric(f"psi_{feature_name}", psi)
+                except Exception as mlflow_e:
+                    logging.warning(f"Failed to log PSI for {feature_name} to MLflow: {mlflow_e}")
+                # --- MLflow Integration End ---
+
                 if psi > self.alert_thresholds['psi']:
                     msg = (f"Feature drift detected for {model_name} v{version} - "
                           f"{feature_name} PSI: {psi:.3f}")

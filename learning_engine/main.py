@@ -2,6 +2,8 @@
 
 import logging
 import time
+import mlflow # Added MLflow import
+import pandas as pd # Assuming data can be represented as pandas DataFrame
 from typing import Optional
 
 from .base import LearningEngine
@@ -49,27 +51,74 @@ class LearningEngineMain:
         """
         logging.info("Starting training cycle")
 
-        # Train and evaluate model
-        model, metrics = self.engine.train_and_evaluate(data)
-
-        # Register new version
+        # --- MLflow Integration Start ---
         model_name = self.engine.model_name
-        version = self.registry.register_model(
-            model_name=model_name,
-            model=model,
-            model_type=self.engine.model_type,
-            metrics=metrics,
-            feature_names=data.feature_names,
-            hyperparams=self.engine.get_hyperparameters()
-        )
+        hyperparams = self.engine.get_hyperparameters()
 
-        # Track initial metrics
-        self.tracker.track_metrics(model_name, version, metrics)
+        # Set experiment name (creates if it doesn't exist)
+        mlflow.set_experiment(model_name)
 
-        # Check if we should deploy this version
-        self._check_deployment(model_name, version, metrics)
+        # Start MLflow run context
+        with mlflow.start_run() as run:
+            run_id = run.info.run_id
+            logging.info(f"Starting MLflow run {run_id} for experiment '{model_name}'")
 
-        logging.info(f"Completed training cycle for {model_name} v{version}")
+            # Log hyperparameters
+            mlflow.log_params(hyperparams)
+
+            # --- Log Input Data using MLflow Datasets ---
+            try:
+                # Assuming 'data' has attributes 'dataframe' and 'source_path'
+                # Adjust this based on your actual data object structure
+                if hasattr(data, 'dataframe') and isinstance(data.dataframe, pd.DataFrame) and hasattr(data, 'source_path'):
+                    training_df = data.dataframe
+                    data_source_path = data.source_path
+                    mlflow_dataset = mlflow.data.from_pandas(training_df, source=data_source_path, name="training_data")
+                    mlflow.log_input(mlflow_dataset, context="training")
+                    logging.info(f"Logged training data input: {data_source_path} (digest: {mlflow_dataset.digest})")
+                elif isinstance(data, pd.DataFrame): # If data itself is the DataFrame
+                     # We need a way to know the source path in this case
+                     # For now, log without source if path unknown
+                     mlflow_dataset = mlflow.data.from_pandas(data, name="training_data")
+                     mlflow.log_input(mlflow_dataset, context="training")
+                     logging.warning("Logged training data input without source path.")
+                else:
+                    logging.warning("Could not log training data to MLflow: Unsupported data format or missing attributes.")
+            except Exception as data_log_e:
+                logging.warning(f"Failed to log training data to MLflow: {data_log_e}")
+            # --- End Data Logging ---
+
+
+            # Train and evaluate model
+            # Note: The actual training logic is within self.engine.train_and_evaluate
+            # If that method also needs to log things during training (e.g., epoch loss),
+            # it would need access to the active run or use nested runs.
+            model, metrics = self.engine.train_and_evaluate(data)
+
+            # Log evaluation metrics (will also be logged by tracker)
+            # mlflow.log_metrics(metrics) # Redundant if tracker logs them
+
+            # Register new version (will log model artifact and register)
+            version = self.registry.register_model(
+                model_name=model_name,
+                model=model,
+                model_type=self.engine.model_type,
+                metrics=metrics, # Pass metrics for metadata, though MLflow logs them separately
+                feature_names=data.feature_names,
+                hyperparams=hyperparams # Pass params for metadata
+            )
+
+            # Track initial metrics (will log metrics and PSI to MLflow)
+            self.tracker.track_metrics(model_name, version, metrics, features=data.get_features_dict()) # Assuming data has a method to get features as dict
+
+            # Log the registered model version as a tag for easy reference
+            mlflow.set_tag("registered_version", version)
+
+            # Check if we should deploy this version
+            self._check_deployment(model_name, version, metrics)
+
+            logging.info(f"Completed MLflow run {run_id} for {model_name} v{version}")
+        # --- MLflow Integration End ---
 
     def _check_deployment(self, model_name: str, version: int, metrics: dict):
         """

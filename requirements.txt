@@ -4,6 +4,20 @@ uvicorn==0.34.0
 python-dotenv==1.0.1
 aiohttp==3.11.14
 websockets==15.0.1
+apscheduler==3.10.4
+scikit-learn==1.4.1.post1
+packaging==24.0
+mlflow==2.14.1
+psycopg2-binary==2.9.9 # PostgreSQL adapter
+python-json-logger==2.0.7
+sentry-sdk==2.7.1
+
+# Core dependencies
+fastapi==0.115.12
+uvicorn==0.34.0
+python-dotenv==1.0.1
+aiohttp==3.11.14
+websockets==15.0.1
 apscheduler==3.10.4 # Added for scheduling
 
 # Data processing
