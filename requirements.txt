@@ -1,53 +1,32 @@
-# Core dependencies
-fastapi==0.115.12
-uvicorn==0.34.0
-python-dotenv==1.0.1
-aiohttp==3.11.14
-websockets==15.0.1
-apscheduler==3.10.4
-scikit-learn==1.4.1.post1
-packaging==24.0
-mlflow==2.14.1
-psycopg2-binary==2.9.9 # PostgreSQL adapter
-python-json-logger==2.0.7
-sentry-sdk==2.7.1
+# Core Libraries
+python-dotenv
+numpy
+pandas
+scipy
+pytz
+redis>=4.0.0,<5.0.0 # Specify async compatible version
+aiohttp
+websockets
+pydantic
+# Or torch-cpu depending on setup
+# NOTE: For GPU support, install via ./install_xgboost_gpu.sh script
 
-# Core dependencies
-fastapi==0.115.12
-uvicorn==0.34.0
-python-dotenv==1.0.1
-aiohttp==3.11.14
-websockets==15.0.1
-apscheduler==3.10.4 # Added for scheduling
+# Broker/API Clients (If installed via pip, otherwise handled by local code)
+alpaca-trade-api # Uncomment if using pip install
 
-# Data processing
-numpy==1.24.3  # Must use <2.0 for compatibility with current XGBoost and SciPy
-pandas==2.2.1
-scipy==1.15.2
+# ML/Ops Tools (Optional, used by removed/offline components)
+# optuna
+# shap
+# alibi-detect
+pybreaker # Circuit breaker library
+asyncio-throttle # Rate limiting
+prometheus-client # Metrics
 
-# Machine Learning
-# XGBoost with GPU support - built from source
-# Use the provided build_xgboost_gpu.sh script to build XGBoost 3.0.0 with CUDA support
-# The script will clone the repository, configure with CUDA support, and install the Python package
-# DO NOT install from PyPI as it lacks GPU support for the GH200 architecture
-scikit-learn==1.4.1.post1
+# Scheduling
+APScheduler>=3.0.0,<4.0.0 # Added Scheduler
 
-# GPU Acceleration
-torch==2.6.0
-cupy-cuda12x==13.4.0  # CUDA 12.8 compatible
-onnx==1.17.0
-/home/ubuntu/TensorRT-10.3.0.26/python/tensorrt-10.3.0-cp310-none-linux_aarch64.whl
-
-# Monitoring and metrics
-prometheus-client==0.19.0
-prometheus-fastapi-instrumentator==6.1.0
-
-# Redis integration
-redis==5.0.1
-# Note: Redis Exporter v1.69.0 is installed as a binary at /usr/local/bin/redis_exporter
-# It was installed directly from GitHub: https://github.com/oliver006/redis_exporter/releases
-
-# Utilities
-packaging==24.0
-python-json-logger==2.0.7
-sentry-sdk==2.7.1
+# Development/Testing
+pytest
+pytest-asyncio
+python-json-logger # Added for logging
+joblib # Added for ML model saving/loading
