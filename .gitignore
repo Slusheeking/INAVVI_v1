@@ -1,25 +1,91 @@
-# Environment variables
-.env
-
-# Virtual environment
-venv/
-
-# Prometheus files
-prometheus-2.51.2.linux-arm64/data/
-prometheus-2.51.2.linux-arm64/prometheus
-prometheus-2.51.2.linux-arm64/promtool
-notes/prometheus-*.tar.gz
-
-# Redis exporter
-redis_exporter-*/
-notes/redis_exporter-*.tar.gz
-
-# Log files
-*.log
-nohup.out
-
-# Cache and build
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
-.pytest_cache/
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# Distribution / packaging
+.Python
+env/
+.env
+*.env
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+
+# Logs
+logs/
+*.log
+
+# VS Code
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# PyCharm
+.idea/
+
+# XGBoost specific
+xgboost/
+
+# Trading specific
+paper_trades.csv
+*credentials*
+*api_key*
+*secret*
+*token*
+
+# CUDA and GPU specific
+*.cu.o
+*.ptx
+*.cubin
+
+# System specific
+.DS_Store
+Thumbs.db
+
+# Model files (be careful with these, you may want to track some models)
+*.model
+*.pkl
+*.joblib
+*.h5
+*.onnx
+
+# Exceptions (files you want to track despite being ignored above)
+!requirements.txt
+!pytest.ini
