@@ -2,6 +2,7 @@
 import pytest
 import asyncio
 import time
+import numpy as np
 from unittest.mock import AsyncMock, MagicMock, patch, call
 from ai_day_trader.strategy import AIStrategyRunner
 from ai_day_trader.config import load_ai_trader_config
@@ -10,6 +11,7 @@ from ai_day_trader.signal_generator import SignalGenerator
 from ai_day_trader.risk_manager import RiskManager
 from ai_day_trader.feature_calculator import FeatureCalculator
 from ai_day_trader.ml.predictor import Predictor as MLEnginePredictor
+from collections import deque
 
 
 @pytest.fixture
@@ -32,16 +34,30 @@ def mock_dependencies():
         "feature_calculator": AsyncMock(spec=FeatureCalculator),
         "alpaca_client": AsyncMock(spec=True)
     }
+
+    # Configure risk manager for ATR stop loss
+    deps["risk_manager"].stop_loss_type = "atr"
+    deps["risk_manager"].atr_feature_name = "atr_14"
+    deps["risk_manager"].atr_stop_multiplier = 2.0
+
     # Set default return values for commonly called methods
     deps["signal_generator"].generate_signals = AsyncMock(return_value=[])
     deps["risk_manager"].get_remaining_daily_limit = AsyncMock(
         return_value=5000.0)
+    deps["risk_manager"].calculate_position_size = AsyncMock(
+        return_value=(10, 1000.0, 95.0))  # qty, value, stop_price
     deps["execution_system"].get_positions = AsyncMock(return_value={})
     deps["stock_selector"].select_candidate_symbols = AsyncMock(return_value=[
                                                                 "AAPL", "MSFT"])
+
     # Mock methods needed for NBBO/Price fetching
+    current_time_ms = time.time() * 1000
     deps["redis_client"].hgetall = AsyncMock(return_value={  # Mock Redis NBBO response
-        b'bid_price': b'99.9', b'ask_price': b'100.1', b'timestamp': str(time.time() * 1000).encode()
+        b'bid_price': b'99.9',
+        b'ask_price': b'100.1',
+        b'timestamp': str(current_time_ms).encode(),
+        b'bid_size': b'100',
+        b'ask_size': b'100'
     })
     deps["redis_client"].get = AsyncMock(
         return_value=None)  # Mock Redis tick miss
@@ -53,15 +69,43 @@ def mock_dependencies():
 async def runner_instance(mock_dependencies):
     """Fixture to create an initialized AIStrategyRunner instance."""
     runner = AIStrategyRunner(**mock_dependencies)
+
+    # Set up price cache for peak detection
+    runner._recent_prices_cache = {
+        "AAPL": deque([98.0, 99.0, 100.0, 101.0, 102.0, 103.0, 102.5, 101.5, 100.5], maxlen=60),
+        "MSFT": deque([245.0, 246.0, 247.0, 248.0, 249.0, 250.0, 249.5, 248.5, 247.5], maxlen=60)
+    }
+
     # Mock internal methods that might be complex or make external calls
     runner._get_latest_price = AsyncMock(
         return_value=100.0)  # Default mock price
+
+    current_time_ms = time.time() * 1000
     runner._get_latest_nbbo = AsyncMock(return_value={
-                                        'bid_price': 99.9, 'ask_price': 100.1, 'timestamp': time.time() * 1000})
+        'bid_price': 99.9,
+        'ask_price': 100.1,
+        'bid_size': 100.0,
+        'ask_size': 100.0,
+        'timestamp': current_time_ms
+    })
+
     runner._evaluate_and_execute_entry = AsyncMock()  # Mock entry logic
     runner._check_exit_conditions = AsyncMock()  # Mock exit logic
-    runner.get_latest_features = AsyncMock(
-        return_value={'feat1': 1.0})  # Mock feature calculation result
+
+    # Mock feature calculation with more comprehensive features including ATR
+    runner.get_latest_features = AsyncMock(return_value={
+        'feat1': 1.0,
+        'atr_14': 2.5,
+        'rsi_14': 65.0,
+        'macd': 0.25,
+        'macd_signal': 0.15,
+        'macd_hist': 0.10,
+        'ema_9': 99.5,
+        'sma_20': 98.0,
+        'volume_change': 1.2
+    })
+
+    return runner
     return runner
 
 
@@ -100,8 +144,25 @@ async def test_process_entries(runner_instance: AIStrategyRunner):
     positions = {"MSFT": {"symbol": "MSFT", "qty": "10"}}
     portfolio_value = 1000.0
     remaining_limit = 5000.0
-    # Mock features map
-    features_map = {"AAPL": {"f1": 1}, "MSFT": {"f1": 2}}
+
+    # Create a more detailed features map with ATR value
+    features_map = {
+        "AAPL": {
+            "atr_14": 2.5,
+            "rsi_14": 65.0,
+            "macd": 0.25,
+            "ema_9": 99.5,
+            "sma_20": 98.0
+        },
+        "MSFT": {
+            "atr_14": 3.2,
+            "rsi_14": 55.0,
+            "macd": -0.10,
+            "ema_9": 248.5,
+            "sma_20": 245.0
+        }
+    }
+
     # Mock signal generator to return signals for both, but MSFT should be skipped
     mock_signals = [
         {"symbol": "AAPL", "side": "buy", "source": "ML"},
@@ -112,7 +173,7 @@ async def test_process_entries(runner_instance: AIStrategyRunner):
 
     await runner._process_entries(symbols, positions, portfolio_value, remaining_limit, features_map)
 
-    # Verify signal_generator was called correctly
+    # Verify signal_generator was called correctly with the enhanced features_map
     runner.signal_generator.generate_signals.assert_awaited_once_with(
         symbols, features_map)
 
@@ -122,10 +183,128 @@ async def test_process_entries(runner_instance: AIStrategyRunner):
     )
 
 
-# TODO: Add tests for _evaluate_and_execute_entry logic (NBBO vs price, risk calls)
-# TODO: Add tests for _monitor_exits logic (calling _check_exit_conditions with features)
-# TODO: Add tests for _check_exit_conditions (NBBO price usage, calling sub-checks)
-# TODO: Add tests for _check_stop_loss (NBBO price usage)
-# TODO: Add tests for _get_latest_price (NBBO vs tick fallback)
-# TODO: Add tests for _get_latest_nbbo (Redis hit/miss/stale)
+@pytest.mark.asyncio
+async def test_monitor_exits_with_features(runner_instance: AIStrategyRunner):
+    """Test the _monitor_exits method with feature map."""
+    runner = runner_instance
+
+    # Mock positions
+    positions = {
+        "AAPL": {"symbol": "AAPL", "qty": "10", "avg_entry_price": "100.0"},
+        # Short position
+        "MSFT": {"symbol": "MSFT", "qty": "-5", "avg_entry_price": "250.0"}
+    }
+
+    # Create feature map with ATR values
+    features_map = {
+        "AAPL": {
+            "atr_14": 2.5,
+            "rsi_14": 65.0,
+            "macd": 0.25,
+            "ema_9": 99.5,
+            "sma_20": 98.0
+        },
+        "MSFT": {
+            "atr_14": 3.2,
+            "rsi_14": 55.0,
+            "macd": -0.10,
+            "ema_9": 248.5,
+            "sma_20": 245.0
+        }
+    }
+
+    # Reset and mock _check_exit_conditions
+    runner._check_exit_conditions = AsyncMock(return_value=None)
+
+    await runner._monitor_exits(positions, features_map)
+
+    # Verify _check_exit_conditions was called for each position with correct features
+    assert runner._check_exit_conditions.await_count == 2
+
+    # Check the calls with assert_any_await to ignore order
+    runner._check_exit_conditions.assert_any_await(
+        "AAPL", positions["AAPL"], features_map["AAPL"]
+    )
+    runner._check_exit_conditions.assert_any_await(
+        "MSFT", positions["MSFT"], features_map["MSFT"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_check_stop_loss_using_atr(runner_instance: AIStrategyRunner):
+    """Test the _check_stop_loss method using ATR-based stop."""
+    runner = runner_instance
+
+    # Temporarily restore the original method for testing
+    original_method = runner._check_stop_loss
+    runner._check_stop_loss = original_method.__get__(runner)
+
+    symbol = "AAPL"
+    pos_info = {"symbol": "AAPL", "qty": "10", "avg_entry_price": "100.0"}
+    pos_qty = 10.0
+    current_price = 95.0  # Below the stop price
+
+    # Feature map with ATR value
+    features = {
+        "atr_14": 2.5,  # ATR value
+        "rsi_14": 30.0,  # Low RSI indicating oversold
+        "macd": -0.5    # Negative MACD indicating downtrend
+    }
+
+    # Stop price should be: entry_price - (atr * multiplier) = 100 - (2.5 * 2.0) = 95.0
+    # Since current_price = 95.0, it's at the stop level and should trigger
+
+    result = await runner._check_stop_loss(symbol, pos_info, pos_qty, current_price, features)
+
+    # Verify the stop loss was triggered using ATR
+    assert result is not None
+    assert "ATR" in result
+    assert "95.0" in result  # The stop price should be mentioned
+
+    # Reset method to avoid interference with other tests
+    runner._check_stop_loss = AsyncMock(return_value=None)
+
+
+@pytest.mark.asyncio
+async def test_get_latest_nbbo(runner_instance: AIStrategyRunner):
+    """Test the _get_latest_nbbo method with Redis data."""
+    runner = runner_instance
+
+    # Temporarily restore the original method for testing
+    original_method = runner._get_latest_nbbo
+    runner._get_latest_nbbo = original_method.__get__(runner)
+
+    # Set up Redis mock to return NBBO data
+    current_time_ms = time.time() * 1000
+    runner.redis_client.hgetall = AsyncMock(return_value={
+        b'bid_price': b'149.5',
+        b'ask_price': b'150.0',
+        b'bid_size': b'200',
+        b'ask_size': b'150',
+        b'timestamp': str(current_time_ms).encode()
+    })
+
+    symbol = "AAPL"
+    result = await runner._get_latest_nbbo(symbol)
+
+    # Verify NBBO data was correctly processed
+    assert result is not None
+    assert result['bid_price'] == 149.5
+    assert result['ask_price'] == 150.0
+    assert result['bid_size'] == 200.0
+    assert result['ask_size'] == 150.0
+    assert 'timestamp' in result
+
+    # Verify Redis was called with the correct key
+    runner.redis_client.hgetall.assert_awaited_once_with(f"nbbo:{symbol}")
+
+    # Reset the method to avoid interference with other tests
+    runner._get_latest_nbbo = AsyncMock()
+
+# These are just initial implementations of some of the TODO tests
+# Additional tests can be implemented for:
+# - _check_peak_exit with the deque-based price cache
+# - _check_ml_exit with features
+# - EOD handling logic
+# - _get_latest_price with NBBO vs tick fallback
 # TODO: Add tests for EOD handling etc.
